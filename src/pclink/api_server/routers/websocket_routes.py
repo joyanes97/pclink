@@ -62,6 +62,13 @@ async def handle_keyboard_command(data: Dict[str, Any], permissions: List[str]):
 
     try:
         action = data.get("action")
+        scan_code = data.get("scan_code")
+        if scan_code is not None:
+            await asyncio.to_thread(
+                input_service.raw_key, int(scan_code), action == "down"
+            )
+            return
+
         key = data.get("key")
         modifiers = data.get("modifiers", [])
 
@@ -201,6 +208,10 @@ async def mobile_websocket_endpoint(websocket: WebSocket, token: str = Query(Non
                             input_service.mouse_up(btn_name)
                         elif btn_action == 2:
                             input_service.mouse_click(btn_name, 1)
+                        continue
+                    elif cmd_type == 0x04 and len(raw_bytes) >= 4:  # KEY_RAW
+                        scan_code, action_val = struct.unpack(">HB", raw_bytes[1:4])
+                        input_service.raw_key(scan_code, action_val == 1)
                         continue
 
             # --- JSON Text Frame Fallback ---

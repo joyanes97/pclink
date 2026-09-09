@@ -59,6 +59,23 @@ class AdbHubService:
         devices: List[Dict[str, Any]] = []
         blocks = output.split("add device ")
 
+        internal_blacklist = (
+            "touchscreen",
+            "ts",
+            "sensor",
+            "fingerprint",
+            "sar",
+            "pmic",
+            "power",
+            "volume",
+            "gpio",
+            "kpd",
+            "hall",
+            "grip",
+            "dummy",
+            "virtual",
+        )
+
         for b in blocks:
             if not b.strip():
                 continue
@@ -67,22 +84,34 @@ class AdbHubService:
             node_match = re.search(r"(/dev/input/event\d+)", header)
             node = node_match.group(1) if node_match else ""
 
-            name = "Unknown Device"
-            is_mouse = False
-            is_keyboard = False
-
             block_text = "\n".join(lines)
             name_match = re.search(r'name:\s*"([^"]+)"', block_text)
-            if name_match:
-                name = name_match.group(1)
-
+            name = name_match.group(1) if name_match else "Unknown Device"
             name_lower = name.lower()
-            if "mouse" in name_lower or "cursor" in name_lower or "REL_X" in block_text:
-                is_mouse = True
-            elif "keyboard" in name_lower or "KEY_" in block_text:
-                is_keyboard = True
 
-            if node:
+            if any(k in name_lower for k in internal_blacklist):
+                continue
+
+            # Skip auxiliary media / system endpoints
+            if "consumer control" in name_lower or "system control" in name_lower:
+                continue
+
+            has_rel = "REL_X" in block_text and "REL_Y" in block_text
+            has_btn = "BTN_MOUSE" in block_text or "BTN_LEFT" in block_text
+            is_mouse = (has_rel and has_btn) or (
+                "mouse" in name_lower and "keyboard" not in name_lower
+            )
+
+            has_alpha = (
+                "KEY_A" in block_text
+                or "KEY_SPACE" in block_text
+                or "KEY_ENTER" in block_text
+                or "KEY_Q" in block_text
+                or "KEY_1" in block_text
+            )
+            is_keyboard = not is_mouse and (has_alpha or "keyboard" in name_lower)
+
+            if node and (is_mouse or is_keyboard):
                 devices.append(
                     {
                         "node": node,
@@ -236,6 +265,11 @@ class AdbHubService:
                             input_service.mouse_up(btn_name)
                         self._last_event_text = (
                             f"BUTTON: {btn_name} {'DOWN' if is_down else 'UP'}"
+                        )
+                    elif code_val > 0:
+                        input_service.raw_key(code_val, is_down)
+                        self._last_event_text = (
+                            f"KEY: {code_val} {'DOWN' if is_down else 'UP'}"
                         )
 
         except asyncio.CancelledError:

@@ -3,9 +3,9 @@
 # Copyright (C) 2025 AZHAR ZOUHIR / BYTEDz
 
 import logging
+import sys
 from typing import List, Optional
 
-from ..core.wayland_utils import is_wayland
 from .linux_evdev_service import LinuxEvdevService
 
 try:
@@ -29,14 +29,17 @@ class InputService:
         self.button_map = {}
         self.key_map = {}
 
-        if is_wayland():
+        # Enable native kernel uinput device across all Linux sessions (Wayland and X11)
+        if sys.platform.startswith("linux"):
             self.evdev = LinuxEvdevService()
             if self.evdev.ui:
                 self.use_evdev = True
-                log.info("InputService: Using evdev (Wayland mode)")
+                log.info(
+                    "InputService: Using Linux kernel evdev (uinput virtual hardware mode)"
+                )
 
         if not self.use_evdev and PYNPUT_AVAILABLE:
-            log.info("InputService: Using pynput (Standard OS mode)")
+            log.info("InputService: Using pynput (Standard OS fallback mode)")
             from pynput.keyboard import Controller as KeyboardController
             from pynput.keyboard import Key
             from pynput.mouse import Button
@@ -89,6 +92,23 @@ class InputService:
     def is_available(self) -> bool:
         """Check if any input backend is active."""
         return self.use_evdev or (self.mouse is not None and self.keyboard is not None)
+
+    def raw_key(self, scan_code: int, is_down: bool):
+        """Passes a raw hardware key scancode directly into the kernel uinput bus."""
+        if self.use_evdev and self.evdev:
+            self.evdev.raw_key(scan_code, is_down)
+        elif self.keyboard:
+            try:
+                from pynput.keyboard import KeyCode
+
+                vk = KeyCode.from_vk(scan_code) if hasattr(KeyCode, "from_vk") else None
+                if vk:
+                    if is_down:
+                        self.keyboard.press(vk)
+                    else:
+                        self.keyboard.release(vk)
+            except Exception as e:
+                log.debug(f"raw_key fallback failed for {scan_code}: {e}")
 
     def mouse_move(self, dx: int, dy: int):
         """Dispatches mouse movement deltas directly to the active hardware/virtual backend."""

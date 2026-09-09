@@ -146,107 +146,24 @@ class LinuxEvdevService:
             return
 
         try:
+            supported_keys = [
+                k
+                for k in range(1, 248)
+                if hasattr(ecodes, "KEY") and k in ecodes.KEY.values()
+            ]
+            if not supported_keys:
+                supported_keys = list(range(1, 248))
+
+            button_keys = [
+                ecodes.BTN_LEFT,
+                ecodes.BTN_RIGHT,
+                ecodes.BTN_MIDDLE,
+                ecodes.BTN_SIDE,
+                ecodes.BTN_EXTRA,
+            ]
+
             capabilities = {
-                ecodes.EV_KEY: [
-                    ecodes.KEY_ESC,
-                    ecodes.KEY_1,
-                    ecodes.KEY_2,
-                    ecodes.KEY_3,
-                    ecodes.KEY_4,
-                    ecodes.KEY_5,
-                    ecodes.KEY_6,
-                    ecodes.KEY_7,
-                    ecodes.KEY_8,
-                    ecodes.KEY_9,
-                    ecodes.KEY_0,
-                    ecodes.KEY_MINUS,
-                    ecodes.KEY_EQUAL,
-                    ecodes.KEY_BACKSPACE,
-                    ecodes.KEY_TAB,
-                    ecodes.KEY_Q,
-                    ecodes.KEY_W,
-                    ecodes.KEY_E,
-                    ecodes.KEY_R,
-                    ecodes.KEY_T,
-                    ecodes.KEY_Y,
-                    ecodes.KEY_U,
-                    ecodes.KEY_I,
-                    ecodes.KEY_O,
-                    ecodes.KEY_P,
-                    ecodes.KEY_LEFTBRACE,
-                    ecodes.KEY_RIGHTBRACE,
-                    ecodes.KEY_ENTER,
-                    ecodes.KEY_LEFTCTRL,
-                    ecodes.KEY_A,
-                    ecodes.KEY_S,
-                    ecodes.KEY_D,
-                    ecodes.KEY_F,
-                    ecodes.KEY_G,
-                    ecodes.KEY_H,
-                    ecodes.KEY_J,
-                    ecodes.KEY_K,
-                    ecodes.KEY_L,
-                    ecodes.KEY_SEMICOLON,
-                    ecodes.KEY_APOSTROPHE,
-                    ecodes.KEY_GRAVE,
-                    ecodes.KEY_LEFTSHIFT,
-                    ecodes.KEY_BACKSLASH,
-                    ecodes.KEY_Z,
-                    ecodes.KEY_X,
-                    ecodes.KEY_C,
-                    ecodes.KEY_V,
-                    ecodes.KEY_B,
-                    ecodes.KEY_N,
-                    ecodes.KEY_M,
-                    ecodes.KEY_COMMA,
-                    ecodes.KEY_DOT,
-                    ecodes.KEY_SLASH,
-                    ecodes.KEY_RIGHTSHIFT,
-                    ecodes.KEY_RIGHTALT,
-                    ecodes.KEY_LEFTALT,
-                    ecodes.KEY_SPACE,
-                    ecodes.KEY_CAPSLOCK,
-                    ecodes.KEY_F1,
-                    ecodes.KEY_F2,
-                    ecodes.KEY_F3,
-                    ecodes.KEY_F4,
-                    ecodes.KEY_F5,
-                    ecodes.KEY_F6,
-                    ecodes.KEY_F7,
-                    ecodes.KEY_F8,
-                    ecodes.KEY_F9,
-                    ecodes.KEY_F10,
-                    ecodes.KEY_F11,
-                    ecodes.KEY_F12,
-                    ecodes.KEY_NUMLOCK,
-                    ecodes.KEY_SCROLLLOCK,
-                    ecodes.KEY_LEFT,
-                    ecodes.KEY_RIGHT,
-                    ecodes.KEY_UP,
-                    ecodes.KEY_DOWN,
-                    ecodes.KEY_DELETE,
-                    ecodes.KEY_HOME,
-                    ecodes.KEY_END,
-                    ecodes.KEY_PAGEUP,
-                    ecodes.KEY_PAGEDOWN,
-                    ecodes.KEY_LEFTMETA,
-                    ecodes.KEY_RIGHTMETA,
-                    ecodes.KEY_COMPOSE,
-                    ecodes.KEY_MENU,
-                    ecodes.KEY_PLAYPAUSE,
-                    ecodes.KEY_PAUSECD,
-                    ecodes.KEY_STOPCD,
-                    ecodes.KEY_NEXTSONG,
-                    ecodes.KEY_PREVIOUSSONG,
-                    ecodes.KEY_VOLUMEUP,
-                    ecodes.KEY_VOLUMEDOWN,
-                    ecodes.KEY_MUTE,
-                    ecodes.BTN_LEFT,
-                    ecodes.BTN_RIGHT,
-                    ecodes.BTN_MIDDLE,
-                    ecodes.BTN_SIDE,
-                    ecodes.BTN_EXTRA,
-                ],
+                ecodes.EV_KEY: list(set(supported_keys + button_keys)),
                 ecodes.EV_REL: [
                     ecodes.REL_X,
                     ecodes.REL_Y,
@@ -257,7 +174,7 @@ class LinuxEvdevService:
 
             self.ui = UInput(capabilities, name="PCLink Virtual Input")
             log.info(
-                "Initialized PCLink Virtual Input device with relative motion, button, and media capabilities."
+                "Initialized PCLink Virtual Input device with full hardware key range and relative motion."
             )
 
             self.btn_map = {
@@ -275,6 +192,13 @@ class LinuxEvdevService:
                 f"Failed to initialize uinput device: {e}. Check /dev/uinput permissions."
             )
             self.ui = None
+
+    def raw_key(self, scan_code: int, is_down: bool):
+        """Dispatches a direct hardware scancode directly into the kernel uinput bus."""
+        if not self.ui:
+            return
+        self.ui.write(ecodes.EV_KEY, scan_code, 1 if is_down else 0)
+        self.ui.syn()
 
     def emit_key_tap(self, keycode: int):
         if not self.ui:
