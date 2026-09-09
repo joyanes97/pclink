@@ -8,10 +8,11 @@ import time
 from collections import deque
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, model_validator
 
 from ...services import input_service
+from ...services.adb_hub_service import adb_hub_service
 
 log = logging.getLogger(__name__)
 
@@ -118,3 +119,39 @@ async def scroll_mouse(payload: MouseScrollModel):
         )
     await asyncio.to_thread(input_service.mouse_scroll, payload.dx, payload.dy)
     return {"status": "scrolled"}
+
+
+class OtgHubStartPayload(BaseModel):
+    device_node: str = ""
+    port: int = 5555
+    sensitivity: float = 1.0
+
+
+@router.get("/otg-hub/status")
+async def get_otg_hub_status():
+    return adb_hub_service.get_status()
+
+
+@router.get("/otg-hub/devices")
+async def get_otg_hub_devices(request: Request, port: int = 5555):
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    devices = await adb_hub_service.query_devices(client_ip, port=port)
+    return {"devices": devices}
+
+
+@router.post("/otg-hub/start")
+async def start_otg_hub(request: Request, payload: OtgHubStartPayload):
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    success = await adb_hub_service.start(
+        host=client_ip,
+        port=payload.port,
+        device_node=payload.device_node,
+        sensitivity=payload.sensitivity,
+    )
+    return {"status": "started" if success else "failed"}
+
+
+@router.post("/otg-hub/stop")
+async def stop_otg_hub():
+    await adb_hub_service.stop()
+    return {"status": "stopped"}

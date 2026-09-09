@@ -3,7 +3,7 @@
 # Copyright (C) 2025 AZHAR ZOUHIR / BYTEDz
 
 import logging
-from typing import List
+from typing import List, Optional
 
 from ..core.wayland_utils import is_wayland
 from .linux_evdev_service import LinuxEvdevService
@@ -29,7 +29,6 @@ class InputService:
         self.button_map = {}
         self.key_map = {}
 
-        # Prefer evdev on Linux + Wayland
         if is_wayland():
             self.evdev = LinuxEvdevService()
             if self.evdev.ui:
@@ -68,6 +67,23 @@ class InputService:
                 "down": Key.down,
                 "left": Key.left,
                 "right": Key.right,
+                "home": Key.home,
+                "end": Key.end,
+                "pageup": Key.page_up,
+                "pagedown": Key.page_down,
+                "caps_lock": Key.caps_lock,
+                "f1": Key.f1,
+                "f2": Key.f2,
+                "f3": Key.f3,
+                "f4": Key.f4,
+                "f5": Key.f5,
+                "f6": Key.f6,
+                "f7": Key.f7,
+                "f8": Key.f8,
+                "f9": Key.f9,
+                "f10": Key.f10,
+                "f11": Key.f11,
+                "f12": Key.f12,
             }
 
     def is_available(self) -> bool:
@@ -91,6 +107,22 @@ class InputService:
             btn = self.button_map.get(button, Button.left)
             self.mouse.click(btn, clicks)
 
+    def mouse_down(self, button: str = "left"):
+        """Holds mouse button down for dragging or text selection."""
+        if self.use_evdev:
+            self.evdev.mouse_down(button)
+        elif self.mouse:
+            btn = self.button_map.get(button, Button.left)
+            self.mouse.press(btn)
+
+    def mouse_up(self, button: str = "left"):
+        """Releases held mouse button."""
+        if self.use_evdev:
+            self.evdev.mouse_up(button)
+        elif self.mouse:
+            btn = self.button_map.get(button, Button.left)
+            self.mouse.release(btn)
+
     def mouse_scroll(self, dx: int, dy: int):
         if not dx and not dy:
             return
@@ -101,9 +133,6 @@ class InputService:
             self.mouse.scroll(dx, dy)
 
     def keyboard_type(self, text: str):
-        log.info(
-            f"[INPUT_SERVICE] keyboard_type: text='{text}', use_evdev={self.use_evdev}"
-        )
         if self.use_evdev:
             self.evdev.type_text(text)
         elif self.keyboard:
@@ -125,10 +154,7 @@ class InputService:
                 except Exception as ex:
                     log.error(f"[INPUT_SERVICE] Clipboard paste fallback failed: {ex}")
 
-    def keyboard_press_key(self, key_str: str, modifiers: List[str] = None):
-        log.info(
-            f"[INPUT_SERVICE] keyboard_press_key: key='{key_str}', modifiers={modifiers}, use_evdev={self.use_evdev}"
-        )
+    def keyboard_press_key(self, key_str: str, modifiers: Optional[List[str]] = None):
         if self.use_evdev:
             self.evdev.press_key(key_str, modifiers)
         elif self.keyboard:
@@ -144,6 +170,34 @@ class InputService:
                     self.keyboard.release(m)
             except Exception as e:
                 log.error(f"Keyboard command failed: {e}")
+
+    def key_down(self, key_str: str, modifiers: Optional[List[str]] = None):
+        """Holds key down for hardware keyboard passthrough."""
+        if self.use_evdev:
+            self.evdev.key_down(key_str, modifiers)
+        elif self.keyboard:
+            try:
+                mods = [self.key_map.get(m.lower(), m) for m in (modifiers or [])]
+                key = self.key_map.get(key_str.lower(), key_str)
+                for m in mods:
+                    self.keyboard.press(m)
+                self.keyboard.press(key)
+            except Exception as e:
+                log.error(f"Key down failed: {e}")
+
+    def key_up(self, key_str: str, modifiers: Optional[List[str]] = None):
+        """Releases held key."""
+        if self.use_evdev:
+            self.evdev.key_up(key_str, modifiers)
+        elif self.keyboard:
+            try:
+                mods = [self.key_map.get(m.lower(), m) for m in (modifiers or [])]
+                key = self.key_map.get(key_str.lower(), key_str)
+                self.keyboard.release(key)
+                for m in reversed(mods):
+                    self.keyboard.release(m)
+            except Exception as e:
+                log.error(f"Key up failed: {e}")
 
 
 # Global instance

@@ -1,3 +1,4 @@
+# src/pclink/services/linux_evdev_service.py
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025 AZHAR ZOUHIR / BYTEDz
 
@@ -215,6 +216,8 @@ class LinuxEvdevService:
                     ecodes.KEY_F8,
                     ecodes.KEY_F9,
                     ecodes.KEY_F10,
+                    ecodes.KEY_F11,
+                    ecodes.KEY_F12,
                     ecodes.KEY_NUMLOCK,
                     ecodes.KEY_SCROLLLOCK,
                     ecodes.KEY_LEFT,
@@ -230,7 +233,6 @@ class LinuxEvdevService:
                     ecodes.KEY_RIGHTMETA,
                     ecodes.KEY_COMPOSE,
                     ecodes.KEY_MENU,
-                    # Media Control Keys
                     ecodes.KEY_PLAYPAUSE,
                     ecodes.KEY_PAUSECD,
                     ecodes.KEY_STOPCD,
@@ -239,10 +241,11 @@ class LinuxEvdevService:
                     ecodes.KEY_VOLUMEUP,
                     ecodes.KEY_VOLUMEDOWN,
                     ecodes.KEY_MUTE,
-                    # Pointer Buttons
                     ecodes.BTN_LEFT,
                     ecodes.BTN_RIGHT,
                     ecodes.BTN_MIDDLE,
+                    ecodes.BTN_SIDE,
+                    ecodes.BTN_EXTRA,
                 ],
                 ecodes.EV_REL: [
                     ecodes.REL_X,
@@ -254,13 +257,17 @@ class LinuxEvdevService:
 
             self.ui = UInput(capabilities, name="PCLink Virtual Input")
             log.info(
-                "Initialized PCLink Virtual Input device with media key capabilities."
+                "Initialized PCLink Virtual Input device with relative motion, button, and media capabilities."
             )
 
             self.btn_map = {
                 "left": ecodes.BTN_LEFT,
                 "right": ecodes.BTN_RIGHT,
                 "middle": ecodes.BTN_MIDDLE,
+                "side": ecodes.BTN_SIDE,
+                "extra": ecodes.BTN_EXTRA,
+                "back": ecodes.BTN_SIDE,
+                "forward": ecodes.BTN_EXTRA,
             }
 
         except Exception as e:
@@ -296,6 +303,20 @@ class LinuxEvdevService:
             self.ui.syn()
             if clicks > 1:
                 time.sleep(0.05)
+
+    def mouse_down(self, button: str = "left"):
+        if not self.ui:
+            return
+        btn = self.btn_map.get(button.lower(), ecodes.BTN_LEFT)
+        self.ui.write(ecodes.EV_KEY, btn, 1)
+        self.ui.syn()
+
+    def mouse_up(self, button: str = "left"):
+        if not self.ui:
+            return
+        btn = self.btn_map.get(button.lower(), ecodes.BTN_LEFT)
+        self.ui.write(ecodes.EV_KEY, btn, 0)
+        self.ui.syn()
 
     def scroll(self, dx: int, dy: int):
         if not self.ui:
@@ -366,6 +387,47 @@ class LinuxEvdevService:
             return (ecodes.KEY_TAB, False, False)
         return None
 
+    def _resolve_keycode(self, key_str: str) -> Optional[Tuple[int, bool, bool]]:
+        named_keys = {
+            "enter": ecodes.KEY_ENTER,
+            "esc": ecodes.KEY_ESC,
+            "tab": ecodes.KEY_TAB,
+            "space": ecodes.KEY_SPACE,
+            "backspace": ecodes.KEY_BACKSPACE,
+            "delete": ecodes.KEY_DELETE,
+            "up": ecodes.KEY_UP,
+            "down": ecodes.KEY_DOWN,
+            "left": ecodes.KEY_LEFT,
+            "right": ecodes.KEY_RIGHT,
+            "home": ecodes.KEY_HOME,
+            "end": ecodes.KEY_END,
+            "pageup": ecodes.KEY_PAGEUP,
+            "pagedown": ecodes.KEY_PAGEDOWN,
+            "caps_lock": ecodes.KEY_CAPSLOCK,
+            "f1": ecodes.KEY_F1,
+            "f2": ecodes.KEY_F2,
+            "f3": ecodes.KEY_F3,
+            "f4": ecodes.KEY_F4,
+            "f5": ecodes.KEY_F5,
+            "f6": ecodes.KEY_F6,
+            "f7": ecodes.KEY_F7,
+            "f8": ecodes.KEY_F8,
+            "f9": ecodes.KEY_F9,
+            "f10": ecodes.KEY_F10,
+            "f11": ecodes.KEY_F11,
+            "f12": ecodes.KEY_F12,
+            "play_pause": ecodes.KEY_PLAYPAUSE,
+            "next": ecodes.KEY_NEXTSONG,
+            "prev": ecodes.KEY_PREVIOUSSONG,
+            "volume_up": ecodes.KEY_VOLUMEUP,
+            "volume_down": ecodes.KEY_VOLUMEDOWN,
+            "mute": ecodes.KEY_MUTE,
+        }
+        main_key = named_keys.get(key_str.lower())
+        if main_key is not None:
+            return (main_key, False, False)
+        return self._char_to_key_event(key_str)
+
     def type_text(self, text: str):
         if not self.ui:
             return
@@ -425,44 +487,18 @@ class LinuxEvdevService:
             "cmd": ecodes.KEY_LEFTMETA,
         }
 
-        named_keys = {
-            "enter": ecodes.KEY_ENTER,
-            "esc": ecodes.KEY_ESC,
-            "tab": ecodes.KEY_TAB,
-            "space": ecodes.KEY_SPACE,
-            "backspace": ecodes.KEY_BACKSPACE,
-            "delete": ecodes.KEY_DELETE,
-            "up": ecodes.KEY_UP,
-            "down": ecodes.KEY_DOWN,
-            "left": ecodes.KEY_LEFT,
-            "right": ecodes.KEY_RIGHT,
-            "home": ecodes.KEY_HOME,
-            "end": ecodes.KEY_END,
-            "pageup": ecodes.KEY_PAGEUP,
-            "pagedown": ecodes.KEY_PAGEDOWN,
-            "play_pause": ecodes.KEY_PLAYPAUSE,
-            "next": ecodes.KEY_NEXTSONG,
-            "prev": ecodes.KEY_PREVIOUSSONG,
-            "volume_up": ecodes.KEY_VOLUMEUP,
-            "volume_down": ecodes.KEY_VOLUMEDOWN,
-            "mute": ecodes.KEY_MUTE,
-        }
-
         mods = [
             mod_map.get(m.lower()) for m in (modifiers or []) if mod_map.get(m.lower())
         ]
-        main_key = named_keys.get(key_str.lower())
 
-        if main_key is None:
-            event = self._char_to_key_event(key_str)
-            if event:
-                main_key, extra_shift, extra_altgr = event
-                if extra_shift and ecodes.KEY_LEFTSHIFT not in mods:
-                    mods.append(ecodes.KEY_LEFTSHIFT)
-                if extra_altgr and ecodes.KEY_RIGHTALT not in mods:
-                    mods.append(ecodes.KEY_RIGHTALT)
+        resolved = self._resolve_keycode(key_str)
+        if resolved:
+            main_key, extra_shift, extra_altgr = resolved
+            if extra_shift and ecodes.KEY_LEFTSHIFT not in mods:
+                mods.append(ecodes.KEY_LEFTSHIFT)
+            if extra_altgr and ecodes.KEY_RIGHTALT not in mods:
+                mods.append(ecodes.KEY_RIGHTALT)
 
-        if main_key:
             for m in mods:
                 self.ui.write(ecodes.EV_KEY, m, 1)
             self.ui.write(ecodes.EV_KEY, main_key, 1)
@@ -472,3 +508,66 @@ class LinuxEvdevService:
             for m in reversed(mods):
                 self.ui.write(ecodes.EV_KEY, m, 0)
             self.ui.syn()
+
+    def key_down(self, key_str: str, modifiers: List[str] = None):
+        if not self.ui:
+            return
+
+        mod_map = {
+            "ctrl": ecodes.KEY_LEFTCTRL,
+            "shift": ecodes.KEY_LEFTSHIFT,
+            "alt": ecodes.KEY_LEFTALT,
+            "altgr": ecodes.KEY_RIGHTALT,
+            "win": ecodes.KEY_LEFTMETA,
+            "cmd": ecodes.KEY_LEFTMETA,
+        }
+
+        mods = [
+            mod_map.get(m.lower()) for m in (modifiers or []) if mod_map.get(m.lower())
+        ]
+
+        resolved = self._resolve_keycode(key_str)
+        if resolved:
+            main_key, extra_shift, extra_altgr = resolved
+            if extra_shift and ecodes.KEY_LEFTSHIFT not in mods:
+                mods.append(ecodes.KEY_LEFTSHIFT)
+            if extra_altgr and ecodes.KEY_RIGHTALT not in mods:
+                mods.append(ecodes.KEY_RIGHTALT)
+
+            for m in mods:
+                self.ui.write(ecodes.EV_KEY, m, 1)
+            self.ui.write(ecodes.EV_KEY, main_key, 1)
+            self.ui.syn()
+
+    def key_up(self, key_str: str, modifiers: List[str] = None):
+        if not self.ui:
+            return
+
+        mod_map = {
+            "ctrl": ecodes.KEY_LEFTCTRL,
+            "shift": ecodes.KEY_LEFTSHIFT,
+            "alt": ecodes.KEY_LEFTALT,
+            "altgr": ecodes.KEY_RIGHTALT,
+            "win": ecodes.KEY_LEFTMETA,
+            "cmd": ecodes.KEY_LEFTMETA,
+        }
+
+        mods = [
+            mod_map.get(m.lower()) for m in (modifiers or []) if mod_map.get(m.lower())
+        ]
+
+        resolved = self._resolve_keycode(key_str)
+        if resolved:
+            main_key, extra_shift, extra_altgr = resolved
+            if extra_shift and ecodes.KEY_LEFTSHIFT not in mods:
+                mods.append(ecodes.KEY_LEFTSHIFT)
+            if extra_altgr and ecodes.KEY_RIGHTALT not in mods:
+                mods.append(ecodes.KEY_RIGHTALT)
+
+            self.ui.write(ecodes.EV_KEY, main_key, 0)
+            for m in reversed(mods):
+                self.ui.write(ecodes.EV_KEY, m, 0)
+            self.ui.syn()
+
+
+linux_evdev_service = LinuxEvdevService()

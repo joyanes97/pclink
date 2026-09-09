@@ -28,7 +28,7 @@ AUTH_CHECK_INTERVAL = 30.0  # seconds
 
 
 def handle_mouse_command_fast(data: Dict[str, Any], permissions: List[str]):
-    """Direct non-blocking execution for mouse movement without thread pool scheduling overhead."""
+    """Direct non-blocking execution for mouse movement and button states."""
     if "input" not in permissions or not input_service.is_available():
         return
 
@@ -45,6 +45,10 @@ def handle_mouse_command_fast(data: Dict[str, Any], permissions: List[str]):
             )
         elif action == "double_click":
             input_service.mouse_click(data.get("button", "left"), 2)
+        elif action in ("down", "button_down"):
+            input_service.mouse_down(data.get("button", "left"))
+        elif action in ("up", "button_up"):
+            input_service.mouse_up(data.get("button", "left"))
     except Exception as e:
         log.error(f"Mouse command '{action}' failed: {e}")
 
@@ -57,11 +61,17 @@ async def handle_keyboard_command(data: Dict[str, Any], permissions: List[str]):
         return
 
     try:
-        log.info(f"[KEYBOARD WS RECEIVED] Payload: {data}")
-        if text := data.get("text"):
+        action = data.get("action")
+        key = data.get("key")
+        modifiers = data.get("modifiers", [])
+
+        if action == "down" and key:
+            await asyncio.to_thread(input_service.key_down, key, modifiers)
+        elif action == "up" and key:
+            await asyncio.to_thread(input_service.key_up, key, modifiers)
+        elif text := data.get("text"):
             await asyncio.to_thread(input_service.keyboard_type, text)
-        elif key := data.get("key"):
-            modifiers = data.get("modifiers", [])
+        elif key:
             await asyncio.to_thread(input_service.keyboard_press_key, key, modifiers)
     except Exception as e:
         log.error(f"Keyboard command failed: {e}", exc_info=True)
@@ -163,21 +173,34 @@ async def mobile_websocket_endpoint(websocket: WebSocket, token: str = Query(Non
                 services = config_manager.get("services", {})
                 last_auth_check = now
 
-            # --- Binary Frame Fast-Path (5 Bytes) ---
+            # --- Binary Frame Fast-Path ---
             if "bytes" in message and message["bytes"]:
                 raw_bytes = message["bytes"]
                 if not services.get("input", True) or "input" not in permissions:
                     continue
 
-                if len(raw_bytes) >= 5:
+                if len(raw_bytes) >= 1:
                     cmd_type = raw_bytes[0]
-                    dx, dy = struct.unpack(">hh", raw_bytes[1:5])
-
-                    if cmd_type == 0x01:  # MOUSE_MOVE
+                    if cmd_type == 0x01 and len(raw_bytes) >= 5:  # MOUSE_MOVE
+                        dx, dy = struct.unpack(">hh", raw_bytes[1:5])
                         input_service.mouse_move(dx, dy)
                         continue
-                    elif cmd_type == 0x02:  # MOUSE_SCROLL
+                    elif cmd_type == 0x02 and len(raw_bytes) >= 5:  # MOUSE_SCROLL
+                        dx, dy = struct.unpack(">hh", raw_bytes[1:5])
                         input_service.mouse_scroll(dx, dy)
+                        continue
+                    elif cmd_type == 0x03 and len(raw_bytes) >= 3:  # MOUSE_BUTTON
+                        btn_code = raw_bytes[1]
+                        btn_action = raw_bytes[2]
+                        btn_name = {1: "left", 2: "right", 3: "middle"}.get(
+                            btn_code, "left"
+                        )
+                        if btn_action == 1:
+                            input_service.mouse_down(btn_name)
+                        elif btn_action == 0:
+                            input_service.mouse_up(btn_name)
+                        elif btn_action == 2:
+                            input_service.mouse_click(btn_name, 1)
                         continue
 
             # --- JSON Text Frame Fallback ---

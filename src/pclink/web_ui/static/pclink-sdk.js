@@ -1,7 +1,7 @@
 /**
  * PCLink Unified Extension Frontend SDK v2.0
  * Provides sandbox communication, Host Broker API access, token propagation,
- * Material 3 theme token injection, and automated dynamic widget height reporting.
+ * Material 3 theme token injection, dynamic widget height reporting, and themed dialog interception.
  */
 (function (global) {
     'use strict';
@@ -14,6 +14,7 @@
             this._extensionId = this._resolveExtensionId();
             this._initThemeSync();
             this._initWidgetAutoResizer();
+            this._initCustomDialogs();
         }
 
         _resolveToken() {
@@ -199,6 +200,193 @@
             global.pclinkReportHeight = reportExactHeight;
         }
 
+        _initCustomDialogs() {
+            if (document.getElementById('pclink-sdk-dialog-style')) return;
+
+            const style = document.createElement('style');
+            style.id = 'pclink-sdk-dialog-style';
+            style.textContent = `
+                .pclink-dialog-overlay {
+                    position: fixed;
+                    inset: 0;
+                    background: rgba(0, 0, 0, 0.65);
+                    backdrop-filter: blur(4px);
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    z-index: 100000;
+                    padding: 16px;
+                    opacity: 0;
+                    transition: opacity 0.15s ease-out;
+                }
+                .pclink-dialog-overlay.active {
+                    opacity: 1;
+                }
+                .pclink-dialog-card {
+                    background: var(--surface, #1e1f22);
+                    border: var(--card-border, 1px solid rgba(255, 255, 255, 0.08));
+                    box-shadow: var(--card-shadow, 0 8px 24px rgba(0, 0, 0, 0.35));
+                    border-radius: var(--radius, 16px);
+                    color: var(--text, #f8fafc);
+                    width: 100%;
+                    max-width: 380px;
+                    padding: 20px;
+                    display: flex;
+                    flex-direction: column;
+                    gap: 12px;
+                    transform: scale(0.95);
+                    transition: transform 0.15s cubic-bezier(0.2, 0, 0, 1);
+                }
+                .pclink-dialog-overlay.active .pclink-dialog-card {
+                    transform: scale(1);
+                }
+                .pclink-dialog-title {
+                    font-size: 0.95rem;
+                    font-weight: 800;
+                    margin: 0;
+                }
+                .pclink-dialog-body {
+                    font-size: 0.82rem;
+                    line-height: 1.45;
+                    color: var(--text-muted, rgba(248, 250, 252, 0.65));
+                    word-break: break-word;
+                }
+                .pclink-dialog-input {
+                    background: var(--surface-hover, rgba(255, 255, 255, 0.08));
+                    border: var(--card-border, 1px solid rgba(255, 255, 255, 0.08));
+                    color: var(--text, #f8fafc);
+                    padding: 10px 12px;
+                    border-radius: calc(var(--radius, 16px) * 0.6);
+                    font-size: 0.85rem;
+                    outline: none;
+                    width: 100%;
+                }
+                .pclink-dialog-input:focus {
+                    border-color: var(--primary, #3b82f6);
+                }
+                .pclink-dialog-actions {
+                    display: flex;
+                    justify-content: flex-end;
+                    gap: 8px;
+                    margin-top: 4px;
+                }
+                .pclink-dialog-btn {
+                    padding: 8px 16px;
+                    font-size: 0.8rem;
+                    font-weight: 700;
+                    border-radius: calc(var(--radius, 16px) * 0.6);
+                    cursor: pointer;
+                    border: var(--card-border, 1px solid rgba(255, 255, 255, 0.08));
+                    background: var(--surface-hover, rgba(255, 255, 255, 0.08));
+                    color: var(--text, #f8fafc);
+                    user-select: none;
+                }
+                .pclink-dialog-btn:active {
+                    transform: scale(0.97);
+                }
+                .pclink-dialog-btn-primary {
+                    background: var(--primary, #3b82f6);
+                    color: var(--on-primary, #ffffff);
+                    border-color: var(--primary, #3b82f6);
+                }
+            `;
+            document.head.appendChild(style);
+
+            const showDialog = ({ title = '', message = '', type = 'alert', defaultValue = '' }) => {
+                return new Promise((resolve) => {
+                    const overlay = document.createElement('div');
+                    overlay.className = 'pclink-dialog-overlay';
+
+                    const defaultTitles = {
+                        alert: 'Notification',
+                        confirm: 'Confirmation',
+                        prompt: 'Input Required'
+                    };
+
+                    const card = document.createElement('div');
+                    card.className = 'pclink-dialog-card';
+
+                    const heading = document.createElement('h3');
+                    heading.className = 'pclink-dialog-title';
+                    heading.textContent = title || defaultTitles[type] || '';
+
+                    const bodyText = document.createElement('div');
+                    bodyText.className = 'pclink-dialog-body';
+                    bodyText.textContent = message;
+
+                    card.appendChild(heading);
+                    card.appendChild(bodyText);
+
+                    let input = null;
+                    if (type === 'prompt') {
+                        input = document.createElement('input');
+                        input.type = 'text';
+                        input.className = 'pclink-dialog-input';
+                        input.value = defaultValue;
+                        card.appendChild(input);
+                    }
+
+                    const actions = document.createElement('div');
+                    actions.className = 'pclink-dialog-actions';
+
+                    const closeWith = (val) => {
+                        overlay.classList.remove('active');
+                        setTimeout(() => {
+                            if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+                            resolve(val);
+                        }, 150);
+                    };
+
+                    if (type === 'confirm' || type === 'prompt') {
+                        const cancelBtn = document.createElement('button');
+                        cancelBtn.className = 'pclink-dialog-btn';
+                        cancelBtn.textContent = 'Cancel';
+                        cancelBtn.onclick = () => closeWith(type === 'prompt' ? null : false);
+                        actions.appendChild(cancelBtn);
+                    }
+
+                    const okBtn = document.createElement('button');
+                    okBtn.className = 'pclink-dialog-btn pclink-dialog-btn-primary';
+                    okBtn.textContent = 'OK';
+                    okBtn.onclick = () => closeWith(type === 'prompt' ? (input ? input.value : '') : true);
+                    actions.appendChild(okBtn);
+
+                    card.appendChild(actions);
+                    overlay.appendChild(card);
+                    document.body.appendChild(overlay);
+
+                    requestAnimationFrame(() => overlay.classList.add('active'));
+
+                    if (input) {
+                        setTimeout(() => input.focus(), 50);
+                        input.onkeydown = (e) => {
+                            if (e.key === 'Enter') okBtn.click();
+                            if (e.key === 'Escape') closeWith(null);
+                        };
+                    } else {
+                        okBtn.focus();
+                    }
+                });
+            };
+
+            this._dialog = showDialog;
+
+            global.alert = (msg) => {
+                if (this.ui && this.ui.haptic) this.ui.haptic('selection');
+                return showDialog({ type: 'alert', message: String(msg) });
+            };
+
+            global.confirm = (msg) => {
+                if (this.ui && this.ui.haptic) this.ui.haptic('selection');
+                return showDialog({ type: 'confirm', message: String(msg) });
+            };
+
+            global.prompt = (msg, defaultText = '') => {
+                if (this.ui && this.ui.haptic) this.ui.haptic('selection');
+                return showDialog({ type: 'prompt', message: String(msg), defaultValue: defaultText });
+            };
+        }
+
         async callBroker(domain, method, params = {}) {
             const headers = { 'Content-Type': 'application/json' };
             if (this._token) {
@@ -290,7 +478,10 @@
                     else if (pattern === 'success') window.navigator.vibrate([15, 30, 15]);
                     else if (pattern === 'error') window.navigator.vibrate([50, 50, 50]);
                 }
-            }
+            },
+            alert: (message, title) => this._dialog({ type: 'alert', message: String(message), title }),
+            confirm: (message, title) => this._dialog({ type: 'confirm', message: String(message), title }),
+            prompt: (message, defaultValue, title) => this._dialog({ type: 'prompt', message: String(message), defaultValue, title })
         };
 
         on(eventName, handler) {
