@@ -404,7 +404,7 @@ def test_ai_stream_route_preserves_upstream_error_detail(api_client):
 
 
 def test_ai_stream_route_returns_upstream_stream(api_client):
-    async def fake_stream(_body):
+    async def fake_stream(_body, _request=None):
         async def chunks():
             yield b'data: {"choices":[]}\n\n'
 

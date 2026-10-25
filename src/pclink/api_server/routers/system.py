@@ -6,7 +6,7 @@ import gettext
 import logging
 from typing import Any, Dict, List
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from ...services import media_service, process_service, system_service
@@ -56,7 +56,11 @@ async def get_running_processes() -> List[ProcessInfo]:
 @system_router.post("/processes/kill")
 async def kill_process(payload: KillPayload) -> Dict[str, str]:
     """Kill process by PID."""
-    msg = await process_service.kill_process(payload.pid)
+    try:
+        msg = await process_service.kill_process(payload.pid)
+    except ValueError as exc:
+        # A missing PID is a client-visible 404, not a generic bad request.
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"status": "success", "message": msg}
 
 

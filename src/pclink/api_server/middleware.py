@@ -7,7 +7,6 @@ import urllib.parse
 from typing import Any
 
 from fastapi import Request, Response
-from fastapi.responses import JSONResponse
 
 from ..core.config import config_manager
 from ..core.device_manager import device_manager
@@ -15,6 +14,7 @@ from ..core.e2ee import decrypt_payload, derive_e2ee_key, encrypt_payload
 from ..core.extension_db import extension_db
 from ..core.share_manager import share_manager
 from ..core.validators import ValidationError
+from .errors import error_response
 from .routers.dependencies import extract_token
 
 log = logging.getLogger(__name__)
@@ -137,10 +137,7 @@ async def e2ee_payload_middleware(request: Request, call_next):
     # 1. Reject LAN-only endpoints arriving over the WAN relay
     if is_wan_relay and any(path.startswith(prefix) for prefix in WAN_BLOCKED_PREFIXES):
         log.warning(f"BLOCKED: LAN-only endpoint accessed over WAN relay: {path}")
-        return JSONResponse(
-            status_code=403,
-            content={"detail": "ENDPOINT_FORBIDDEN_OVER_WAN"},
-        )
+        return error_response(403, "ENDPOINT_FORBIDDEN_OVER_WAN")
 
     # 2. Enforce Zero-Trust: All WAN requests (mutations and confidential GET queries) must be E2EE
     if is_wan_relay and not has_e2ee:
@@ -148,10 +145,7 @@ async def e2ee_payload_middleware(request: Request, call_next):
             log.warning(
                 f"BLOCKED: Plaintext request received over WAN tunnel without E2EE: {request.method} {path}"
             )
-            return JSONResponse(
-                status_code=403,
-                content={"detail": "E2EE_REQUIRED_OVER_WAN"},
-            )
+            return error_response(403, "E2EE_REQUIRED_OVER_WAN")
 
     if not has_e2ee:
         return await call_next(request)
@@ -212,10 +206,7 @@ async def e2ee_payload_middleware(request: Request, call_next):
 
         except Exception as e:
             log.error(f"E2EE Decryption failure on {path}: {e}")
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "E2EE_DECRYPTION_FAILED"},
-            )
+            return error_response(400, "E2EE_DECRYPTION_FAILED")
 
     # 4. Call route handler
     response = await call_next(request)
@@ -275,10 +266,10 @@ async def service_enforcement_middleware(request: Request, call_next):
             log.warning(
                 f"Blocking request to globally disabled service '{target_service}': {path}"
             )
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "detail": f"The '{target_service}' service is currently disabled globally.",
+            return error_response(
+                403,
+                f"The '{target_service}' service is currently disabled globally.",
+                details={
                     "service": target_service,
                     "action": "ENABLE_SERVICE_IN_UI",
                 },
@@ -312,20 +303,19 @@ async def service_enforcement_middleware(request: Request, call_next):
                         log.warning(
                             f"Device '{device.device_name}' ({device.device_id}) denied access to '{target_service}'"
                         )
-                        return JSONResponse(
-                            status_code=403,
-                            content={
-                                "detail": "PERMISSION_DENIED",
-                                "required": target_service,
-                            },
+                        return error_response(
+                            403,
+                            "PERMISSION_DENIED",
+                            details={"required": target_service},
                         )
                     return await call_next(request)
             except ValidationError:
                 pass
 
-        return JSONResponse(
-            status_code=403,
-            content={"detail": "AUTHENTICATION_REQUIRED", "service": target_service},
+        return error_response(
+            403,
+            "AUTHENTICATION_REQUIRED",
+            details={"service": target_service},
         )
 
     return await call_next(request)
@@ -360,10 +350,7 @@ def create_extension_middleware(extension_manager: Any):
                         log.warning(
                             f"Blocking request to disabled or unknown extension: {extension_id} (Path: {path})"
                         )
-                    return JSONResponse(
-                        status_code=404,
-                        content={"detail": f"Extension '{extension_id}' Not Found"},
-                    )
+                    return error_response(404, f"Extension '{extension_id}' Not Found")
         return await call_next(request)
 
     return extension_runtime_middleware

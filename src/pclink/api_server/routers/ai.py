@@ -243,7 +243,18 @@ async def openai_chat_completions(request: Request):
 
     stream = bool(body.get("stream", False))
 
-    await ai_service.ensure_running()
+    try:
+        await ai_service.ensure_running()
+    except HTTPException as start_error:
+        if start_error.status_code != 202:
+            raise
+        # Cold start is now non-blocking: hand the client the engine state and
+        # a Retry-After instead of holding the request open for up to 120s.
+        return JSONResponse(
+            status_code=202,
+            content=start_error.detail,
+            headers=dict(start_error.headers or {}),
+        )
 
     # Always execute on the weight the host actually loaded, even if the
     # client sent a stale filename or the "default" sentinel.
@@ -254,7 +265,7 @@ async def openai_chat_completions(request: Request):
         # Open the upstream stream before constructing StreamingResponse so
         # llama-server errors become real HTTP responses (and keep their
         # actionable JSON detail) instead of a bare 500 mid-stream.
-        stream_body = await ai_service.proxy_stream_chat(body)
+        stream_body = await ai_service.proxy_stream_chat(body, request)
 
         return StreamingResponse(
             stream_body,

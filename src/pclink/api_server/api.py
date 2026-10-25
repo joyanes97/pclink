@@ -11,7 +11,11 @@ from typing import Any, Dict
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from .errors import error_response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
@@ -121,40 +125,68 @@ def create_api_app(controller_instance, connected_devices: Dict) -> FastAPI:
     )
 
     # --- Global Exception Handlers ---
+    #
+    # Every failure funnels through errors.error_response() so clients parse one
+    # envelope ({code, message, retryable, details}) instead of guessing.
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+        # 2xx/3xx HTTPException values are control flow (e.g. the AI cold-start
+        # 202) and must keep their original body.
+        if exc.status_code < 400:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content=exc.detail,
+                headers=exc.headers,
+            )
+        return error_response(exc.status_code, exc.detail, exc.headers)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(request: Request, exc: RequestValidationError):
+        # Pydantic context values can hold exception objects; flatten them so
+        # the envelope always stays JSON-serializable.
+        cleaned = []
+        for error in exc.errors():
+            item = {key: value for key, value in error.items() if key != "ctx"}
+            ctx = error.get("ctx")
+            if isinstance(ctx, dict):
+                item["ctx"] = {key: str(value) for key, value in ctx.items()}
+            cleaned.append(item)
+        return error_response(422, cleaned)
+
     @app.exception_handler(ValueError)
     async def value_error_handler(request: Request, exc: ValueError):
-        return JSONResponse(status_code=400, content={"detail": str(exc)})
+        return error_response(400, str(exc))
 
     @app.exception_handler(FileNotFoundError)
     async def not_found_error_handler(request: Request, exc: FileNotFoundError):
-        return JSONResponse(
-            status_code=404, content={"detail": _("File or directory not found")}
-        )
+        return error_response(404, str(exc) or _("File or directory not found"))
 
     @app.exception_handler(PermissionError)
     async def permission_error_handler(request: Request, exc: PermissionError):
-        return JSONResponse(status_code=403, content={"detail": _("Permission denied")})
+        return error_response(403, str(exc) or _("Permission denied"))
 
     @app.exception_handler(FileExistsError)
     async def file_exists_error_handler(request: Request, exc: FileExistsError):
-        return JSONResponse(
-            status_code=409, content={"detail": _("Target already exists")}
-        )
+        return error_response(409, _("Target already exists"))
 
     @app.exception_handler(NotADirectoryError)
     async def not_a_dir_error_handler(request: Request, exc: NotADirectoryError):
-        return JSONResponse(
-            status_code=400, content={"detail": _("Target is not a directory")}
-        )
+        return error_response(400, _("Target is not a directory"))
 
     @app.exception_handler(shutil.SameFileError)
     async def same_file_error_handler(request: Request, exc: shutil.SameFileError):
-        return JSONResponse(status_code=409, content={"detail": "SOURCE_IS_DEST"})
+        return error_response(409, "SOURCE_IS_DEST")
 
     @app.exception_handler(PCLinkError)
     async def pclink_error_handler(request: Request, exc: PCLinkError):
         status_code = 403 if isinstance(exc, SecurityError) else 400
-        return JSONResponse(status_code=status_code, content={"detail": str(exc)})
+        return error_response(status_code, str(exc))
+
+    @app.exception_handler(Exception)
+    async def unhandled_exception_handler(request: Request, exc: Exception):
+        log.exception("Unhandled error on %s %s", request.method, request.url.path)
+        return error_response(500, "An unexpected server error occurred.")
 
     from .ws_manager import mobile_manager, ui_manager
     from ..core.device_manager import device_manager

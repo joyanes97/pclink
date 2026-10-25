@@ -11,6 +11,7 @@ src_path = Path(__file__).parent.parent / "src"
 sys.path.insert(0, str(src_path))
 
 from pclink.api_server.api import create_api_app  # noqa: E402
+from pclink.core.device_manager import CANONICAL_PERMISSIONS  # noqa: E402
 
 
 @pytest.fixture
@@ -42,29 +43,9 @@ def api_client(mock_controller, mock_devices):
     ) as mock_get_device:
         mock_device = MagicMock()
         mock_device.is_approved = True
-        mock_device.permissions = [
-            "info",
-            "power",
-            "volume",
-            "wol",
-            "files_browse",
-            "files_download",
-            "files_upload",
-            "files_delete",
-            "processes",
-            "mouse",
-            "keyboard",
-            "media",
-            "terminal",
-            "macros",
-            "apps",
-            "utils",
-            "extensions",
-            "desktop_streaming",
-            "command",
-            "clipboard",
-            "screenshot",
-        ]
+        # Mirror the canonical permission set: the middleware gates on these
+        # names, so a stale list silently turns every test into a 403.
+        mock_device.permissions = sorted(CANONICAL_PERMISSIONS)
         mock_get_device.return_value = mock_device
 
         # Use a fixed API key for all requests to satisfy the middleware

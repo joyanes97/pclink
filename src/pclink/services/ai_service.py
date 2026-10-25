@@ -22,7 +22,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 import psutil
 from fastapi import HTTPException, UploadFile
@@ -69,6 +69,14 @@ DEFAULT_CONFIG = {
     "startup_timeout_seconds": 120,
     "request_timeout_seconds": 300,
 }
+
+# Chat admission control. llama-server exposes a fixed number of inference
+# slots (--parallel); requests beyond that wait briefly in a bounded queue and
+# then fail fast with 503 + Retry-After instead of piling up until the client
+# or reverse proxy times out.
+_CHAT_QUEUE_TIMEOUT_SECONDS = 30.0
+_MAX_QUEUED_CHAT_REQUESTS = 8
+_INFLIGHT_DRAIN_TIMEOUT_SECONDS = 30.0
 
 _SAFE_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _HF_REPO_RE = re.compile(
@@ -251,6 +259,13 @@ class AiService:
         self._tasks: set = set()
         self._health_cache: Tuple[float, str] = (0.0, "down")
         self._hf_cache: Dict[str, Tuple[float, object]] = {}
+
+        # Chat admission control and lifecycle coordination.
+        self._inflight_chats: int = 0
+        self._queued_chats: int = 0
+        self._draining: bool = False
+        self._start_task: Optional[asyncio.Task] = None
+        self._stderr_thread: Optional[threading.Thread] = None
 
         # Model download state
         self._downloading_model: bool = False
@@ -1678,6 +1693,9 @@ class AiService:
                 "models_revision": self._models_revision(installed_models),
                 "installed_models_count": len(installed_models),
                 "state_revision": self._state_revision,
+                # Canonical endpoint contract (relative to the server root).
+                "control_base": "/ai",
+                "inference_base": "/ai/v1",
             }
         except Exception as e:
             logger.exception(f"Unhandled error in get_status: {e}")
@@ -1700,6 +1718,8 @@ class AiService:
                 "models_revision": "0",
                 "installed_models_count": 0,
                 "state_revision": self._state_revision,
+                "control_base": "/ai",
+                "inference_base": "/ai/v1",
                 "error_message": str(e),
             }
 
@@ -1707,11 +1727,14 @@ class AiService:
         if self.process is not None:
             exit_code = self.process.poll()
             if exit_code is not None:
+                exited = self.process
                 self.process = None
                 self._active_port = None
                 self._engine_state = "error"
                 if not self._last_error:
                     self._last_error = f"Engine exited unexpectedly (code {exit_code})"
+                # Release the stderr pipe promptly so the reader thread can end.
+                self._close_stderr_pipe(exited)
                 return "error"
             if self._engine_state in ("starting", "loading", "ready"):
                 return self._engine_state
@@ -1821,7 +1844,13 @@ class AiService:
             except Exception:
                 logger.exception("Error while reading llama-server stderr")
 
-        threading.Thread(target=read_stderr, daemon=True).start()
+        thread = threading.Thread(
+            target=read_stderr,
+            daemon=True,
+            name="pclink-llama-stderr",
+        )
+        self._stderr_thread = thread
+        thread.start()
 
     def _verify_llama_health(self, port: Optional[int] = None) -> bool:
         """Checks if llama-server is healthy and answering on the port."""
@@ -1916,14 +1945,7 @@ class AiService:
         self.process = None
         self._active_port = None
         if process:
-            try:
-                process.terminate()
-                process.wait(timeout=2.0)
-            except Exception:
-                try:
-                    process.kill()
-                except Exception:
-                    pass
+            self._reap_process_blocking(process)
         self._cleanup_stale_pid()
 
     def _engine_env(self, bin_path: Path) -> dict:
@@ -2099,6 +2121,7 @@ class AiService:
                 self._engine_state = "error"
                 self._bump_state_revision()
                 PID_FILE.unlink(missing_ok=True)
+                await asyncio.to_thread(self._release_stderr, process)
                 err_details = "\n".join(self._stderr_lines[-5:])
                 hint = ""
                 if self._stderr_has_oom:
@@ -2161,22 +2184,72 @@ class AiService:
         except OSError:
             logger.exception("Failed to stop llama-server")
 
+    def _close_stderr_pipe(self, process: subprocess.Popen) -> None:
+        """Close the child's stderr so the drain thread sees EOF."""
+        stderr = getattr(process, "stderr", None)
+        if stderr is not None:
+            try:
+                stderr.close()
+            except Exception:
+                pass
+
+    def _join_stderr_thread(self, timeout: float = 2.0) -> None:
+        thread = self._stderr_thread
+        self._stderr_thread = None
+        if (
+            thread is not None
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=timeout)
+
+    def _release_stderr(self, process: subprocess.Popen) -> None:
+        """Close the pipe and join the drain thread. Blocking; use a thread."""
+        self._close_stderr_pipe(process)
+        self._join_stderr_thread(2.0)
+
+    def _reap_process_blocking(self, process: subprocess.Popen) -> None:
+        """Terminate the child and release its stderr reader. Blocking."""
+        self._terminate_process_blocking(process)
+        self._release_stderr(process)
+
+    async def _drain_inflight_chats(self) -> None:
+        """Let active generations finish before the engine is torn down."""
+        deadline = time.monotonic() + _INFLIGHT_DRAIN_TIMEOUT_SECONDS
+        while self._inflight_chats > 0 and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        if self._inflight_chats > 0:
+            logger.warning(
+                "Stopping AI engine with %s chat request(s) still in flight "
+                "after %.0fs drain timeout.",
+                self._inflight_chats,
+                _INFLIGHT_DRAIN_TIMEOUT_SECONDS,
+            )
+
     async def _stop_server_locked(self) -> dict:
-        self._engine_state = "stopped"
-        self._bump_state_revision()
-        self._loading_model = None
-        self._loading_message = None
-        self._loading_progress = None
-        self._last_error = None
-        self._health_cache = (0.0, "down")
+        # Refuse new chats, then let in-flight generations finish so an idle
+        # unload or a model switch never cuts a live stream with a 502.
+        self._draining = True
+        try:
+            await self._drain_inflight_chats()
 
-        process = self.process
-        self.process = None
-        self._active_port = None
-        if process:
-            await asyncio.to_thread(self._terminate_process_blocking, process)
+            self._engine_state = "stopped"
+            self._bump_state_revision()
+            self._loading_model = None
+            self._loading_message = None
+            self._loading_progress = None
+            self._last_error = None
+            self._health_cache = (0.0, "down")
 
-        PID_FILE.unlink(missing_ok=True)
+            process = self.process
+            self.process = None
+            self._active_port = None
+            if process:
+                await asyncio.to_thread(self._reap_process_blocking, process)
+
+            PID_FILE.unlink(missing_ok=True)
+        finally:
+            self._draining = False
 
         logger.info("Local AI engine stopped (RAM/VRAM freed).")
         return {"success": True, "running": False, "state": "stopped"}
@@ -2192,50 +2265,62 @@ class AiService:
             logger.exception("Failed to shut down local AI engine")
 
     async def ensure_running(self):
-        """Ensures the local server is running and resets the idle timer."""
+        """Non-blocking chat admission.
+
+        Never waits for a cold start. While the engine is stopped, starting, or
+        loading this raises ``HTTPException(202)`` carrying the current engine
+        state and a ``Retry-After`` header, so the caller can return 202 and the
+        client can retry instead of holding a request open for up to
+        ``startup_timeout_seconds``.
+        """
         self._last_request_time = time.time()
         state = await asyncio.to_thread(self.get_engine_state)
 
         if state == "ready":
             return
 
-        if state in ("starting", "loading"):
-            cfg = self._read_config()
-            timeout = int(cfg.get("startup_timeout_seconds", 120) or 120)
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
-                await asyncio.sleep(0.5)
-                state = await asyncio.to_thread(self.get_engine_state)
-                if state == "ready":
-                    self._last_request_time = time.time()
-                    return
-                if state in ("stopped", "error"):
-                    break
-            if state != "ready":
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        self._last_error
-                        or "The local model is still loading. Retry shortly."
-                    ),
-                )
-            return
-
         if state == "error":
             raise HTTPException(
                 status_code=503,
                 detail=self._last_error or "Local AI engine is in an error state.",
+                headers={"Retry-After": "5"},
             )
 
-        result = await self.start_server()
-        if result.get("state") != "ready":
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    self._last_error
-                    or "The local model is still loading. Retry shortly."
-                ),
-            )
+        if state == "stopped":
+            engine_path = self.get_active_engine_path()
+            if not engine_path or not engine_path.exists():
+                self._engine_state = "error"
+                self._last_error = "llama.cpp engine binary is not installed."
+                raise HTTPException(status_code=400, detail=self._last_error)
+
+            model_path = self.get_active_model_path()
+            if not model_path or not model_path.exists():
+                self._engine_state = "error"
+                self._last_error = "No active GGUF model installed or selected."
+                raise HTTPException(status_code=400, detail=self._last_error)
+
+            # Start in the background; this request returns 202 immediately.
+            if not self._draining and (
+                self._start_task is None or self._start_task.done()
+            ):
+                self._engine_state = "starting"
+                self._bump_state_revision()
+                self._start_task = self._spawn(self._start_server_in_background())
+
+        current = state if state in ("starting", "loading") else self._engine_state
+        if current not in ("starting", "loading"):
+            current = "starting"
+
+        raise HTTPException(
+            status_code=202,
+            detail={
+                "detail": "The local AI engine is starting. Retry shortly.",
+                "engine_state": current,
+                "model": self.get_active_model_name(),
+                "retry_after_seconds": 2,
+            },
+            headers={"Retry-After": "2"},
+        )
 
     async def _idle_watcher(self):
         """Periodically checks if the model has been idle for > timeout and unloads it."""
@@ -2463,37 +2548,152 @@ class AiService:
                 detail=f"Could not reach the local AI engine. {exc}",
             )
 
+    def get_max_concurrent_chats(self) -> int:
+        """Number of inference slots llama-server was started with."""
+        try:
+            parallel = int(self._read_config().get("parallel", 1) or 1)
+        except (TypeError, ValueError):
+            parallel = 1
+        return max(1, parallel)
+
+    async def _acquire_chat_slot(self) -> None:
+        """Admission control: bounded concurrency with a bounded wait queue."""
+        limit = self.get_max_concurrent_chats()
+        deadline = time.monotonic() + _CHAT_QUEUE_TIMEOUT_SECONDS
+        queued = False
+        try:
+            while True:
+                if self._draining:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="The local AI engine is shutting down. Retry shortly.",
+                        headers={"Retry-After": "2"},
+                    )
+
+                if self._inflight_chats < limit:
+                    self._inflight_chats += 1
+                    return
+
+                if not queued:
+                    if self._queued_chats >= _MAX_QUEUED_CHAT_REQUESTS:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="The local AI engine is busy. Retry shortly.",
+                            headers={"Retry-After": "5"},
+                        )
+                    self._queued_chats += 1
+                    queued = True
+
+                if time.monotonic() >= deadline:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Timed out waiting for a free AI inference slot.",
+                        headers={"Retry-After": "5"},
+                    )
+
+                await asyncio.sleep(0.05)
+        finally:
+            if queued:
+                self._queued_chats = max(0, self._queued_chats - 1)
+
+    def _release_chat_slot(self) -> None:
+        if self._inflight_chats > 0:
+            self._inflight_chats -= 1
+
+    @staticmethod
+    def _close_upstream(response: Any) -> None:
+        """Close the upstream HTTP response, which closes its socket.
+
+        That socket close is what makes llama-server abandon generation for a
+        stream whose consumer is gone. Blocking; call it through a thread.
+        """
+        try:
+            response.close()
+        except Exception:
+            pass
+
+    async def _abort_stream_on_disconnect(
+        self, request: Any, response: Any, on_abort: Any = None
+    ) -> None:
+        """Close the upstream response as soon as the client disconnects.
+
+        This unwinds the blocked ``readline`` in the worker thread instead of
+        leaving llama-server decoding into a dead stream and holding a slot.
+        """
+        try:
+            while True:
+                await asyncio.sleep(0.5)
+                if await request.is_disconnected():
+                    logger.info(
+                        "Client disconnected mid-stream; aborting llama-server request."
+                    )
+                    await asyncio.to_thread(self._close_upstream, response)
+                    if on_abort is not None:
+                        on_abort()
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Disconnect watchdog stopped", exc_info=True)
+
     async def proxy_sync_chat(self, body: dict) -> dict:
         self._last_request_time = time.time()
+        await self._acquire_chat_slot()
+        try:
+            timeout = int(self._read_config().get("request_timeout_seconds", 300))
+            loop = asyncio.get_running_loop()
+            response, _ = await loop.run_in_executor(
+                None, self._open_llama_chat, body, timeout, "application/json"
+            )
+
+            def _read_response():
+                try:
+                    return json.loads(response.read().decode("utf-8"))
+                except Exception as exc:
+                    logger.error("Invalid response from llama-server: %s", exc)
+                    raise HTTPException(
+                        status_code=502,
+                        detail="The local AI engine returned an invalid response.",
+                    )
+                finally:
+                    self._close_upstream(response)
+
+            result = await loop.run_in_executor(None, _read_response)
+            self._last_request_time = time.time()
+            return result
+        finally:
+            self._release_chat_slot()
+
+    async def proxy_stream_chat(
+        self, body: dict, request: Any = None
+    ) -> AsyncGenerator[bytes, None]:
+        """Open an SSE stream, holding one inference slot for its lifetime."""
+        self._last_request_time = time.time()
+        await self._acquire_chat_slot()
+
         timeout = int(self._read_config().get("request_timeout_seconds", 300))
         loop = asyncio.get_running_loop()
-        response, _ = await loop.run_in_executor(
-            None, self._open_llama_chat, body, timeout, "application/json"
-        )
+        try:
+            response, _ = await loop.run_in_executor(
+                None, self._open_llama_chat, body, timeout, "text/event-stream"
+            )
+        except BaseException:
+            self._release_chat_slot()
+            raise
 
-        def _read_response():
-            try:
-                return json.loads(response.read().decode("utf-8"))
-            except Exception as exc:
-                logger.error("Invalid response from llama-server: %s", exc)
-                raise HTTPException(
-                    status_code=502,
-                    detail="The local AI engine returned an invalid response.",
-                )
-            finally:
-                response.close()
+        released = False
 
-        result = await loop.run_in_executor(None, _read_response)
-        self._last_request_time = time.time()
-        return result
+        def _release_once() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                self._release_chat_slot()
 
-    async def proxy_stream_chat(self, body: dict) -> AsyncGenerator[bytes, None]:
-        self._last_request_time = time.time()
-        timeout = int(self._read_config().get("request_timeout_seconds", 300))
-        loop = asyncio.get_running_loop()
-        response, _ = await loop.run_in_executor(
-            None, self._open_llama_chat, body, timeout, "text/event-stream"
-        )
+        watcher: Optional[asyncio.Task] = None
+        if request is not None:
+            watcher = asyncio.create_task(
+                self._abort_stream_on_disconnect(request, response, _release_once)
+            )
 
         async def _iter_response():
             try:
@@ -2504,7 +2704,16 @@ class AiService:
                     self._last_request_time = time.time()
                     yield line
             finally:
-                response.close()
+                try:
+                    if watcher is not None:
+                        watcher.cancel()
+                        await asyncio.gather(watcher, return_exceptions=True)
+                except BaseException:
+                    pass
+                try:
+                    await asyncio.to_thread(self._close_upstream, response)
+                finally:
+                    _release_once()
 
         return _iter_response()
 

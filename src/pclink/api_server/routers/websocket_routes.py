@@ -155,7 +155,8 @@ async def mobile_websocket_endpoint(websocket: WebSocket, token: str = Query(Non
     ext_manager = getattr(websocket.app.state, "extension_manager", None)
     is_safe_mode = getattr(ext_manager, "safe_mode", False) if ext_manager else False
 
-    await websocket.send_json(
+    await mobile_manager.send(
+        websocket,
         {
             "type": "SYNC_STATE",
             "services": services,
@@ -163,15 +164,16 @@ async def mobile_websocket_endpoint(websocket: WebSocket, token: str = Query(Non
             "server_id": DiscoveryService.generate_server_id(),
             "remote_access_url": config_manager.get("remote_access_url", ""),
             "safe_mode": is_safe_mode,
-        }
+        },
     )
 
     if services.get("info", True):
-        await websocket.send_json(
+        await mobile_manager.send(
+            websocket,
             {
                 "type": "telemetry_history",
                 "data": system_service.get_telemetry_history(),
-            }
+            },
         )
 
     type_service_map = {
@@ -257,7 +259,7 @@ async def mobile_websocket_endpoint(websocket: WebSocket, token: str = Query(Non
 
                 try:
                     if msg_type == "ping":
-                        await websocket.send_json({"type": "pong"})
+                        await mobile_manager.send(websocket, {"type": "pong"})
                     elif msg_type == "mouse_control":
                         await handle_mouse_command_fast(data, permissions)
                     elif msg_type == "keyboard_control":
@@ -292,7 +294,7 @@ async def mobile_websocket_endpoint(websocket: WebSocket, token: str = Query(Non
             {"device_id": device_id, "reason": str(e)},
         )
     finally:
-        mobile_manager.disconnect(websocket)
+        await mobile_manager.disconnect(websocket)
 
         from ...services.desktop_streaming_service import desktop_streaming_service
 
@@ -317,8 +319,9 @@ async def web_ui_websocket_endpoint(websocket: WebSocket):
         getattr(controller, "mobile_api_enabled", False) if controller else False
     )
 
-    await websocket.send_json(
-        {"type": "server_status", "status": "running" if is_running else "stopped"}
+    await ui_manager.send(
+        websocket,
+        {"type": "server_status", "status": "running" if is_running else "stopped"},
     )
 
     try:
@@ -348,7 +351,7 @@ async def web_ui_websocket_endpoint(websocket: WebSocket):
     except (WebSocketDisconnect, RuntimeError, OSError, asyncio.CancelledError):
         pass
     finally:
-        ui_manager.disconnect(websocket)
+        await ui_manager.disconnect(websocket)
 
 
 async def broadcast_updates_task(mobile_mgr, ui_mgr, state):

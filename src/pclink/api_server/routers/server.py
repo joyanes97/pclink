@@ -85,6 +85,12 @@ async def server_status(request: Request):
         "version": __version__,
         "safe_mode": is_safe_mode,
         "capabilities": resolve_server_capabilities(),
+        # Explicit AI endpoint contract: clients must never derive these by
+        # guessing at URL suffixes.
+        "ai": {
+            "control_base": "/ai",
+            "inference_base": "/ai/v1",
+        },
         "server_id": DiscoveryService.generate_server_id(),
         "port": getattr(request.app.state, "host_port", 38080),
         "platform": sys.platform,
