@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: pclink-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # Fetch pre-built FerrumCast binaries from its GitHub Releases repository.
   build-ferrumcast:
@@ -257,11 +261,10 @@ jobs:
           fi
 
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists. Updating notes and uploading assets..."
-            gh release edit "$TAG" --notes-file RELEASE_NOTES.md
-            gh release upload "$TAG" ./artifacts/*/* ./artifacts/PKGBUILD SHA256SUMS.txt
+            echo "Release $TAG already exists (created locally). Uploading assets only; leaving release notes untouched."
+            gh release upload "$TAG" --clobber ./artifacts/*/* ./artifacts/PKGBUILD SHA256SUMS.txt
           else
-            echo "Creating new release $TAG..."
+            echo "Creating new release $TAG from CHANGELOG fallback..."
             gh release create "$TAG" ./artifacts/*/* ./artifacts/PKGBUILD SHA256SUMS.txt \
               --title "Release $TAG" \
               --notes-file RELEASE_NOTES.md \

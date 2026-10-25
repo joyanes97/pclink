@@ -11,17 +11,17 @@ import argparse
 import re
 from pathlib import Path
 
+FILES_TO_UPDATE = {
+    "src/pclink/core/version.py": r'__version__ = "[^"]+"',
+    "pyproject.toml": r'version = "[^"]+"',
+}
 
-def update_version(version: str):
-    """Update version in all necessary project files."""
-    print(f"Updating version to '{version}' in all relevant files...")
 
-    files_to_update = {
-        "src/pclink/core/version.py": r'__version__ = "[^"]+"',
-        "pyproject.toml": r'version = "[^"]+"',
-    }
+def get_version_updates(version: str):
+    """Return the version-file changes without writing them to disk."""
+    updates = {}
 
-    for file_str, pattern in files_to_update.items():
+    for file_str, pattern in FILES_TO_UPDATE.items():
         path = Path(file_str)
         if not path.exists():
             print(f"  - Warning: {path} not found, skipping.")
@@ -32,8 +32,23 @@ def update_version(version: str):
         new_content = re.sub(
             pattern, f'{pattern.split("=")[0].strip()} = "{version}"', content
         )
+        if new_content != content:
+            updates[path] = new_content
+
+    return updates
+
+
+def update_version(version: str):
+    """Update version in all necessary project files."""
+    print(f"Updating version to '{version}' in all relevant files...")
+
+    updates = get_version_updates(version)
+    for path, new_content in updates.items():
         path.write_text(new_content, encoding="utf-8")
         print(f"  - Updated: {path}")
+
+    if not updates:
+        print("  - No version changes were necessary.")
 
     return True
 
