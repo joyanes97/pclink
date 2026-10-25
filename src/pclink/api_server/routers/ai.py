@@ -6,7 +6,7 @@ import asyncio
 import logging
 from typing import Optional
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from ...services.ai_service import ai_service
 from .dependencies import verify_api_key
@@ -245,6 +245,11 @@ async def openai_chat_completions(request: Request):
 
     await ai_service.ensure_running()
 
+    # Always execute on the weight the host actually loaded, even if the
+    # client sent a stale filename or the "default" sentinel.
+    active_model = ai_service.normalize_chat_model(body)
+    model_headers = {"X-PCLink-Model": active_model} if active_model else {}
+
     if stream:
         # Open the upstream stream before constructing StreamingResponse so
         # llama-server errors become real HTTP responses (and keep their
@@ -258,8 +263,9 @@ async def openai_chat_completions(request: Request):
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
+                **model_headers,
             },
         )
     else:
         result = await ai_service.proxy_sync_chat(body)
-        return result
+        return JSONResponse(content=result, headers=model_headers)

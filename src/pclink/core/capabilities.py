@@ -20,6 +20,9 @@ def resolve_server_capabilities() -> List[str]:
         "power_control",
         "macros",
         "wake_on_lan",
+        # Local llama.cpp engine. Advertised so clients can feature-detect
+        # local AI control instead of guessing from URL patterns.
+        "ai_local",
     ]
 
     services = config_manager.get("services", {})

@@ -19,6 +19,11 @@ from .validators import ValidationError
 log = logging.getLogger(__name__)
 _ = gettext.gettext
 
+# `last_seen` is persisted at most once per device per interval. The auth path
+# runs on every authenticated request, and a read-modify-write there costs two
+# SQLite connections plus the global manager lock per call.
+LAST_SEEN_PERSIST_INTERVAL_SECONDS = 60.0
+
 CANONICAL_PERMISSIONS = {
     "files_read",
     "files_write",
@@ -204,6 +209,7 @@ class DeviceManager:
         self.db_path = db_path or (constants.APP_DATA_PATH / "devices.db")
         self._lock = threading.RLock()
         self._is_recovering: bool = False
+        self._last_seen_persisted: Dict[str, float] = {}
         self._init_database()
 
     def _recover_corrupted_db(self, exc: Exception):
@@ -415,6 +421,7 @@ class DeviceManager:
             )
             deleted = cursor.rowcount > 0
             conn.commit()
+            self._last_seen_persisted.pop(device_id, None)
 
         if deleted:
             log.info(f"Revoked device: {device_id}")
@@ -471,14 +478,37 @@ class DeviceManager:
             cursor = conn.execute("SELECT * FROM blacklist ORDER BY banned_at DESC")
             return [dict(row) for row in cursor.fetchall()]
 
-    def update_device_last_seen(self, device_id: str) -> bool:
+    def touch_device(self, device: Device) -> bool:
+        """Refresh ``last_seen`` in memory and report whether a write is due.
+
+        This is called on every authenticated request, so it must stay O(1) and
+        must never touch SQLite. Persistence is debounced by
+        ``LAST_SEEN_PERSIST_INTERVAL_SECONDS``.
+        """
+        device.last_seen = datetime.now(timezone.utc)
+        now = time.monotonic()
         with self._lock:
-            device = self.get_device_by_id(device_id)
-            if not device:
+            last = self._last_seen_persisted.get(device.device_id, 0.0)
+            if now - last < LAST_SEEN_PERSIST_INTERVAL_SECONDS:
                 return False
-            device.last_seen = datetime.now(timezone.utc)
-            self._save_device(device)
+            self._last_seen_persisted[device.device_id] = now
             return True
+
+    def update_device_last_seen(self, device_id: str) -> bool:
+        """Persist ``last_seen`` with a single targeted UPDATE.
+
+        Deliberately not a read-modify-write: replacing the whole row could
+        resurrect a device that was revoked between the read and the write.
+        Blocking; call it through ``asyncio.to_thread`` from async code.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._get_connection() as conn:
+            cursor = conn.execute(
+                "UPDATE devices SET last_seen = ? WHERE device_id = ?",
+                (now, device_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
 
     def get_device_by_id(self, device_id: str) -> Optional[Device]:
         with self._lock, self._get_connection() as conn:

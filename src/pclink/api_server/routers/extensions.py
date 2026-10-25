@@ -2,6 +2,8 @@
 # Copyright (C) 2025 AZHAR ZOUHIR / BYTEDz
 
 import asyncio
+import concurrent.futures
+import functools
 import gettext
 import hashlib
 import json
@@ -36,6 +38,85 @@ runtime_router = APIRouter(tags=["extension-runtime"])
 
 IMPLICIT_FRAMEWORK_FEATURES = {"theme", "theme.read"}
 REPETITIVE_POLLING_PATHS = {"/downloads", "/status", "/sessions", "/stats"}
+
+# ==========================================
+# Extension Broker: off-loop execution
+# ==========================================
+#
+# Every broker capability (subprocess, filesystem, network, storage, input)
+# is blocking. Running any of it on the event loop stalls every device,
+# WebSocket and AI stream in the process, so it is dispatched to a dedicated
+# pool that cannot starve the default executor used by the DB and AI paths.
+
+_BROKER_MAX_WORKERS = 16
+_BROKER_MAX_CONCURRENT_PER_EXTENSION = 4
+_BROKER_QUEUE_TIMEOUT_SECONDS = 5.0
+_BROKER_MAX_OPERATION_SECONDS = 30
+_BROKER_LOG_BODY_LIMIT = 512
+
+_BROKER_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_BROKER_MAX_WORKERS,
+    thread_name_prefix="pclink-ext-broker",
+)
+
+# Keyed by (loop identity, extension id): a module-level asyncio primitive
+# must never be reused across event loops (uvicorn reloads, test loops).
+_broker_semaphores: Dict[Tuple[int, str], asyncio.Semaphore] = {}
+
+
+def _get_broker_semaphore(extension_id: str) -> asyncio.Semaphore:
+    """Per-extension admission control so one extension cannot flood the pool."""
+    key = (id(asyncio.get_running_loop()), extension_id)
+    semaphore = _broker_semaphores.get(key)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(_BROKER_MAX_CONCURRENT_PER_EXTENSION)
+        _broker_semaphores[key] = semaphore
+    return semaphore
+
+
+def _clamp_timeout(value: Any, default: int, maximum: int) -> int:
+    """Coerce an extension-supplied timeout into a bounded integer."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(parsed, maximum))
+
+
+def _summarize_body(body: Any) -> str:
+    """Bound broker bodies before they reach logs (they can be whole files)."""
+    try:
+        encoded = json.dumps(body)
+    except (TypeError, ValueError):
+        return "<unserializable>"
+    if len(encoded) > _BROKER_LOG_BODY_LIMIT:
+        return f"{encoded[:_BROKER_LOG_BODY_LIMIT]}... ({len(encoded)} chars)"
+    return encoded
+
+
+async def _run_in_worker(
+    extension_id: str, func: Any, /, *args: Any, **kwargs: Any
+) -> Any:
+    """Run a blocking broker operation off the event loop, with backpressure."""
+    semaphore = _get_broker_semaphore(extension_id)
+    try:
+        await asyncio.wait_for(
+            semaphore.acquire(), timeout=_BROKER_QUEUE_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Extension broker is busy; retry shortly.",
+        ) from exc
+
+    try:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            _BROKER_EXECUTOR, functools.partial(func, *args, **kwargs)
+        )
+    finally:
+        semaphore.release()
+
 
 MARKETPLACE_UPSTREAM_URLS = [
     "https://raw.githubusercontent.com/BYTEDz/pclink-extensions/main/extensions.json",
@@ -625,8 +706,10 @@ async def broker_rpc_gateway(
         body = await request.json()
     except Exception:
         body = {}
+    if not isinstance(body, dict):
+        body = {"value": body}
 
-    body_summary = json.dumps(body) if body else ""
+    body_summary = _summarize_body(body)
     log_msg = f"[EXTENSION BROKER: {clean_id}] -> {domain}.{method}({body_summary})"
     log.info(log_msg)
     extension_manager.record_extension_log(
@@ -634,70 +717,10 @@ async def broker_rpc_gateway(
     )
 
     try:
-        if domain == "event":
-            context.publish_event(method, body)
-            return {"success": True, "event": method}
-        elif domain == "system" and method == "exec":
-            return context.exec.run(
-                command=body.get("command", ""),
-                timeout=body.get("timeout", 15),
-                cwd=body.get("cwd"),
-            )
-        elif domain == "fs":
-            if method == "readText":
-                return {"content": context.fs.read_text(body.get("path", ""))}
-            elif method == "writeText":
-                return {
-                    "success": context.fs.write_text(
-                        body.get("path", ""), body.get("content", "")
-                    )
-                }
-            elif method == "listDir":
-                return {"items": context.fs.list_dir(body.get("path", "."))}
-        elif domain == "fetch" and method == "request":
-            return context.fetch.request(
-                url=body.get("url", ""),
-                method=body.get("method", "GET"),
-                headers=body.get("headers"),
-                body=body.get("body"),
-                timeout=body.get("timeout", 10),
-            )
-        elif domain == "storage":
-            if method == "get":
-                return {
-                    "value": context.storage.get(
-                        body.get("key", ""), body.get("default")
-                    )
-                }
-            elif method == "set":
-                return {
-                    "success": context.storage.set(
-                        body.get("key", ""), body.get("value")
-                    )
-                }
-        elif domain == "input":
-            if method == "mouseMove":
-                context.input.mouse_move(body.get("dx", 0), body.get("dy", 0))
-            elif method == "mouseClick":
-                context.input.mouse_click(
-                    body.get("button", "left"), body.get("clicks", 1)
-                )
-            elif method == "pressKey":
-                context.input.keyboard_press_key(
-                    body.get("keyStr", ""), body.get("modifiers", [])
-                )
-            return {"success": True}
-        elif domain == "media":
-            if method == "getState":
-                return await context.media.get_state()
-            elif method == "command":
-                action = body.get("action", "")
-                await context.media.command(action)
-                return {"success": True, "action": action}
-        elif domain == "power" and method == "execute":
-            await context.power.execute(body.get("action", ""))
-            return {"success": True}
-        elif domain == "notifications" and method == "show":
+        # --- Already-async or loop-bound capabilities: stay on the loop ---
+        # NotificationAPI.show schedules an asyncio task, so it cannot run in a
+        # worker thread. It performs no blocking I/O itself.
+        if domain == "notifications" and method == "show":
             return {
                 "success": context.notification.show(
                     body.get("title", ""),
@@ -706,8 +729,120 @@ async def broker_rpc_gateway(
                 )
             }
 
+        if domain == "media":
+            if method == "getState":
+                return await context.media.get_state()
+            if method == "command":
+                action = body.get("action", "")
+                await context.media.command(action)
+                return {"success": True, "action": action}
+            raise HTTPException(400, f"Unsupported broker method '{domain}.{method}'")
+
+        if domain == "power" and method == "execute":
+            await context.power.execute(body.get("action", ""))
+            return {"success": True}
+
+        # --- Blocking capabilities: always executed in the broker pool ---
+        if domain == "event":
+            await _run_in_worker(clean_id, context.publish_event, method, body)
+            return {"success": True, "event": method}
+
+        if domain == "system" and method == "exec":
+            return await _run_in_worker(
+                clean_id,
+                context.exec.run,
+                command=body.get("command", ""),
+                timeout=_clamp_timeout(
+                    body.get("timeout", 15), 15, _BROKER_MAX_OPERATION_SECONDS
+                ),
+                cwd=body.get("cwd"),
+            )
+
+        if domain == "fs":
+            if method == "readText":
+                content = await _run_in_worker(
+                    clean_id, context.fs.read_text, body.get("path", "")
+                )
+                return {"content": content}
+            if method == "writeText":
+                written = await _run_in_worker(
+                    clean_id,
+                    context.fs.write_text,
+                    body.get("path", ""),
+                    body.get("content", ""),
+                )
+                return {"success": written}
+            if method == "listDir":
+                items = await _run_in_worker(
+                    clean_id, context.fs.list_dir, body.get("path", ".")
+                )
+                return {"items": items}
+            raise HTTPException(400, f"Unsupported broker method '{domain}.{method}'")
+
+        if domain == "fetch" and method == "request":
+            return await _run_in_worker(
+                clean_id,
+                context.fetch.request,
+                url=body.get("url", ""),
+                method=body.get("method", "GET"),
+                headers=body.get("headers"),
+                body=body.get("body"),
+                timeout=_clamp_timeout(
+                    body.get("timeout", 10), 10, _BROKER_MAX_OPERATION_SECONDS
+                ),
+            )
+
+        if domain == "storage":
+            if method == "get":
+                value = await _run_in_worker(
+                    clean_id,
+                    context.storage.get,
+                    body.get("key", ""),
+                    body.get("default"),
+                )
+                return {"value": value}
+            if method == "set":
+                stored = await _run_in_worker(
+                    clean_id,
+                    context.storage.set,
+                    body.get("key", ""),
+                    body.get("value"),
+                )
+                return {"success": stored}
+            raise HTTPException(400, f"Unsupported broker method '{domain}.{method}'")
+
+        if domain == "input":
+            if method == "mouseMove":
+                await _run_in_worker(
+                    clean_id,
+                    context.input.mouse_move,
+                    body.get("dx", 0),
+                    body.get("dy", 0),
+                )
+            elif method == "mouseClick":
+                await _run_in_worker(
+                    clean_id,
+                    context.input.mouse_click,
+                    body.get("button", "left"),
+                    body.get("clicks", 1),
+                )
+            elif method == "pressKey":
+                await _run_in_worker(
+                    clean_id,
+                    context.input.keyboard_press_key,
+                    body.get("keyStr", ""),
+                    body.get("modifiers", []),
+                )
+            else:
+                raise HTTPException(
+                    400, f"Unsupported broker method '{domain}.{method}'"
+                )
+            return {"success": True}
+
         raise HTTPException(400, f"Unsupported broker method '{domain}.{method}'")
 
+    except HTTPException:
+        raise
     except PermissionError as e:
         log.warning(f"Broker permission denied for '{clean_id}': {e}")
         extension_manager.record_extension_log(
@@ -755,7 +890,9 @@ async def proxy_isolated_extension_http(
             target_id, f"HTTP {request.method} {subpath_clean}"
         )
 
-    res = extension_manager.dispatch_ipc_http_request(
+    res = await _run_in_worker(
+        target_id,
+        extension_manager.dispatch_ipc_http_request,
         extension_id=target_id,
         method=request.method,
         subpath=subpath_clean,

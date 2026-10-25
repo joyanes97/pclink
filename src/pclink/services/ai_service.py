@@ -239,6 +239,15 @@ class AiService:
         # Serializes start/stop/select so concurrent client requests cannot
         # spawn two llama-server processes or race on the active model.
         self._start_lock = asyncio.Lock()
+        # Serializes model selection itself so two clients cannot interleave
+        # their config writes and stop/start calls. The background start still
+        # runs after this lock is released; _start_server_locked re-checks the
+        # active model and restarts if a newer selection won.
+        self._select_lock = asyncio.Lock()
+        # Monotonic counter bumped on every externally visible AI state change.
+        # Clients use it to detect changes made by other clients and to ignore
+        # stale poll responses.
+        self._state_revision: int = 0
         self._tasks: set = set()
         self._health_cache: Tuple[float, str] = (0.0, "down")
         self._hf_cache: Dict[str, Tuple[float, object]] = {}
@@ -294,6 +303,14 @@ class AiService:
     # ==========================================
     # 1. Config, Validation & Paths
     # ==========================================
+
+    def _bump_state_revision(self) -> int:
+        """Marks the AI subsystem state as changed for connected clients."""
+        self._state_revision += 1
+        return self._state_revision
+
+    def get_state_revision(self) -> int:
+        return self._state_revision
 
     def _read_config(self) -> dict:
         cfg = dict(DEFAULT_CONFIG)
@@ -355,10 +372,13 @@ class AiService:
         old_port = self.get_port()
         self._write_config(cfg)
         restart_required = cfg.get("port") != old_port and self.is_running()
+        if any(key in updates for key in validators):
+            self._bump_state_revision()
         return {
             "success": True,
             "config": cfg,
             "restart_required": restart_required,
+            "state_revision": self._state_revision,
         }
 
     def get_port(self) -> int:
@@ -869,6 +889,7 @@ class AiService:
         cfg["active_version"] = tag
         self._write_config(cfg)
         self._health_cache = (0.0, "down")
+        self._bump_state_revision()
         return {"success": True, "active_version": tag}
 
     def delete_engine_version(self, tag: str) -> dict:
@@ -1277,6 +1298,7 @@ class AiService:
             await self.select_active_model(filename, start_engine=False)
 
         size = target.stat().st_size
+        self._bump_state_revision()
         return {
             "success": True,
             "filename": filename,
@@ -1306,6 +1328,7 @@ class AiService:
             if not self.get_active_model_name():
                 await self.select_active_model(filename, start_engine=False)
 
+            self._bump_state_revision()
             return {
                 "success": True,
                 "filename": filename,
@@ -1499,29 +1522,35 @@ class AiService:
         if not target.exists():
             raise HTTPException(status_code=404, detail=f"Model {filename} not found.")
 
-        cfg = self._read_config()
-        already_active = cfg.get("active_model") == filename
-        was_running = await asyncio.to_thread(self.is_running)
-        cfg["active_model"] = filename
-        self._write_config(cfg)
+        # Serialize the whole read/write/stop/start sequence. Without this,
+        # two clients selecting different weights at the same time can leave
+        # active.json and the running process pointing at different files.
+        async with self._select_lock:
+            cfg = self._read_config()
+            already_active = cfg.get("active_model") == filename
+            was_running = await asyncio.to_thread(self.is_running)
+            cfg["active_model"] = filename
+            self._write_config(cfg)
+            self._bump_state_revision()
 
-        if was_running and not already_active:
-            await self.stop_server()
-        if (start_engine or was_running) and not (already_active and was_running):
-            self._spawn(self._start_server_in_background())
+            if was_running and not already_active:
+                await self.stop_server()
+            if (start_engine or was_running) and not (already_active and was_running):
+                self._spawn(self._start_server_in_background())
 
-        return {
-            "success": True,
-            "active_model": filename,
-            "engine_state": (
-                "starting"
-                if (start_engine or was_running)
-                and not (already_active and was_running)
-                else "ready"
-                if was_running
-                else "stopped"
-            ),
-        }
+            return {
+                "success": True,
+                "active_model": filename,
+                "engine_state": (
+                    "starting"
+                    if (start_engine or was_running)
+                    and not (already_active and was_running)
+                    else "ready"
+                    if was_running
+                    else "stopped"
+                ),
+                "state_revision": self._state_revision,
+            }
 
     async def _start_server_in_background(self):
         try:
@@ -1560,6 +1589,7 @@ class AiService:
             cfg["active_model"] = None
             self._write_config(cfg)
 
+        self._bump_state_revision()
         return {"success": True, "deleted": filename}
 
     # ==========================================
@@ -1638,12 +1668,16 @@ class AiService:
                     "gpu_layers": cfg.get("gpu_layers"),
                     "context_size": cfg.get("context_size"),
                     "idle_timeout_seconds": cfg.get("idle_timeout_seconds"),
+                    "port": cfg.get("port"),
                     "threads": cfg.get("threads"),
                     "parallel": cfg.get("parallel"),
+                    "startup_timeout_seconds": cfg.get("startup_timeout_seconds"),
+                    "request_timeout_seconds": cfg.get("request_timeout_seconds"),
                 },
                 "system": self._system_profile(),
                 "models_revision": self._models_revision(installed_models),
                 "installed_models_count": len(installed_models),
+                "state_revision": self._state_revision,
             }
         except Exception as e:
             logger.exception(f"Unhandled error in get_status: {e}")
@@ -1665,6 +1699,7 @@ class AiService:
                 "system": self._system_profile(),
                 "models_revision": "0",
                 "installed_models_count": 0,
+                "state_revision": self._state_revision,
                 "error_message": str(e),
             }
 
@@ -1929,21 +1964,37 @@ class AiService:
             raise HTTPException(status_code=400, detail=self._last_error)
 
         if self.process is not None and self.process.poll() is None:
-            state = self.get_engine_state()
-            return {
-                "success": True,
-                "running": state == "ready",
-                "model": model_path.name,
-                "state": state,
-            }
+            active_model = self.get_active_model_name()
+            if (
+                self._loading_model
+                and active_model
+                and self._loading_model != active_model
+            ):
+                # A newer selection landed while this start was queued. Stop
+                # the stale weight and fall through to start the active one.
+                logger.info(
+                    "AI engine is running %s but %s is active; restarting.",
+                    self._loading_model,
+                    active_model,
+                )
+                await self._stop_server_locked()
+            else:
+                state = await asyncio.to_thread(self.get_engine_state)
+                return {
+                    "success": True,
+                    "running": state == "ready",
+                    "model": model_path.name,
+                    "state": state,
+                }
 
         port = self.get_port()
         # Never kill whatever owns the port. If it is a foreign runtime (for
         # example Ollama or a user-started llama.cpp), fail with an actionable
         # error instead of silently proxying to the wrong model.
         if self._is_port_in_use(port):
-            healthy, _ = self._probe_llama_health(port, use_cache=False)
+            healthy, _ = await asyncio.to_thread(self._probe_llama_health, port, False)
             self._engine_state = "error"
+            self._bump_state_revision()
             if healthy:
                 self._last_error = (
                     f"Port {port} is already used by another llama-server instance. "
@@ -1957,6 +2008,7 @@ class AiService:
             raise HTTPException(status_code=409, detail=self._last_error)
 
         self._engine_state = "starting"
+        self._bump_state_revision()
         self._loading_model = model_path.name
         self._loading_message = "Initializing engine and allocating buffers..."
         self._loading_progress = 5.0
@@ -2045,6 +2097,7 @@ class AiService:
                 self.process = None
                 self._active_port = None
                 self._engine_state = "error"
+                self._bump_state_revision()
                 PID_FILE.unlink(missing_ok=True)
                 err_details = "\n".join(self._stderr_lines[-5:])
                 hint = ""
@@ -2059,9 +2112,12 @@ class AiService:
                 )
                 raise HTTPException(status_code=500, detail=self._last_error)
 
-            healthy, health_state = self._probe_llama_health(port, use_cache=False)
+            healthy, health_state = await asyncio.to_thread(
+                self._probe_llama_health, port, False
+            )
             if healthy:
                 self._engine_state = "ready"
+                self._bump_state_revision()
                 self._loading_message = "Engine ready"
                 self._loading_progress = 100.0
                 return {
@@ -2085,8 +2141,29 @@ class AiService:
         async with self._start_lock:
             return await self._stop_server_locked()
 
+    @staticmethod
+    def _terminate_process_blocking(process: subprocess.Popen) -> None:
+        """Terminate a child process.
+
+        ``process.wait()`` blocks for up to 2s (4s when a kill is required), so
+        this must always be invoked through ``asyncio.to_thread`` from async
+        code.
+        """
+        try:
+            process.terminate()
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+                process.wait(timeout=2.0)
+            except Exception:
+                logger.exception("Failed to force-stop llama-server")
+        except OSError:
+            logger.exception("Failed to stop llama-server")
+
     async def _stop_server_locked(self) -> dict:
         self._engine_state = "stopped"
+        self._bump_state_revision()
         self._loading_model = None
         self._loading_message = None
         self._loading_progress = None
@@ -2097,17 +2174,7 @@ class AiService:
         self.process = None
         self._active_port = None
         if process:
-            try:
-                process.terminate()
-                process.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                try:
-                    process.kill()
-                    process.wait(timeout=2.0)
-                except Exception:
-                    logger.exception("Failed to force-stop llama-server")
-            except OSError:
-                logger.exception("Failed to stop llama-server")
+            await asyncio.to_thread(self._terminate_process_blocking, process)
 
         PID_FILE.unlink(missing_ok=True)
 
@@ -2194,6 +2261,19 @@ class AiService:
     # ==========================================
     # 5. Reverse Proxy for OpenAI Endpoints
     # ==========================================
+
+    def normalize_chat_model(self, body: dict) -> Optional[str]:
+        """Force the request model to the host's active weight.
+
+        llama-server always serves the weight it was started with, but mobile
+        clients may still send a stale filename or the ``default`` sentinel.
+        Rewriting the field keeps the executed model and the model reported in
+        responses identical instead of silently disagreeing.
+        """
+        active = self.get_active_model_name()
+        if active:
+            body["model"] = active
+        return active
 
     def list_openai_models(self) -> dict:
         """OpenAI-compatible model discovery without waking a cold engine.

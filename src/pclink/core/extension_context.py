@@ -27,6 +27,11 @@ PERMISSION_ALIASES: Dict[str, set] = {
     "notifications": {"notifications", "notification"},
 }
 
+# Hard cap on extension HTTP responses. Broker calls run in a worker thread
+# (see extensions.py::_run_in_worker); an unbounded read would pin that worker
+# and the memory it holds for as long as the upstream keeps streaming.
+MAX_FETCH_RESPONSE_BYTES = 5 * 1024 * 1024
+
 
 class PermissionDeniedError(PermissionError):
     pass
@@ -86,6 +91,7 @@ class ExecAPI(ExtensionAPI):
         kwargs: Dict[str, Any] = {
             "shell": isinstance(command, str),
             "capture_output": True,
+            "stdin": subprocess.DEVNULL,
             "text": True,
             "timeout": timeout,
             "cwd": cwd,
@@ -199,18 +205,32 @@ class FetchAPI(ExtensionAPI):
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                content = resp.read().decode("utf-8", errors="ignore")
-                return {
+                raw = resp.read(MAX_FETCH_RESPONSE_BYTES + 1)
+                truncated = len(raw) > MAX_FETCH_RESPONSE_BYTES
+                result = {
                     "status_code": resp.status,
                     "headers": dict(resp.headers),
-                    "body": content,
+                    "body": raw[:MAX_FETCH_RESPONSE_BYTES].decode(
+                        "utf-8", errors="ignore"
+                    ),
                 }
+                if truncated:
+                    result["truncated"] = True
+                return result
         except urllib.error.HTTPError as e:
-            return {
+            try:
+                raw = e.read(MAX_FETCH_RESPONSE_BYTES + 1)
+            finally:
+                e.close()
+            truncated = len(raw) > MAX_FETCH_RESPONSE_BYTES
+            result = {
                 "status_code": e.code,
-                "headers": dict(e.headers),
-                "body": e.read().decode("utf-8", errors="ignore"),
+                "headers": dict(e.headers) if e.headers else {},
+                "body": raw[:MAX_FETCH_RESPONSE_BYTES].decode("utf-8", errors="ignore"),
             }
+            if truncated:
+                result["truncated"] = True
+            return result
         except Exception as e:
             return {"status_code": 500, "headers": {}, "body": str(e)}
 

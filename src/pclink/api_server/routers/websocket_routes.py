@@ -3,6 +3,8 @@
 # Copyright (C) 2025 AZHAR ZOUHIR / BYTEDz
 
 import asyncio
+import concurrent.futures
+import functools
 import gettext
 import json
 import logging
@@ -26,29 +28,48 @@ router = APIRouter(tags=["WebSocket"])
 
 AUTH_CHECK_INTERVAL = 30.0  # seconds
 
+# Input events are high-frequency (up to ~60/s for pointer movement) and
+# strictly order-sensitive (button-down must precede button-up). A dedicated
+# single-worker executor keeps them off the event loop without reordering them,
+# and keeps them from consuming the shared default executor used by DB/AI work.
+_INPUT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="pclink-input"
+)
 
-def handle_mouse_command_fast(data: Dict[str, Any], permissions: List[str]):
-    """Direct non-blocking execution for mouse movement and button states."""
+
+async def _run_input(func: Any, /, *args: Any) -> Any:
+    """Execute a blocking input_service call in the ordered input worker."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_INPUT_EXECUTOR, functools.partial(func, *args))
+
+
+async def handle_mouse_command_fast(data: Dict[str, Any], permissions: List[str]):
+    """Executes mouse movement and button states off the event loop."""
     if "input" not in permissions or not input_service.is_available():
         return
 
     action = data.get("action")
     try:
         if action == "move":
-            input_service.mouse_move(data.get("dx", 0), data.get("dy", 0))
+            await _run_input(
+                input_service.mouse_move, data.get("dx", 0), data.get("dy", 0)
+            )
         elif action == "scroll":
-            input_service.mouse_scroll(data.get("dx", 0), data.get("dy", 0))
+            await _run_input(
+                input_service.mouse_scroll, data.get("dx", 0), data.get("dy", 0)
+            )
         elif action == "click":
-            input_service.mouse_click(
+            await _run_input(
+                input_service.mouse_click,
                 data.get("button", "left"),
                 data.get("clicks", 1),
             )
         elif action == "double_click":
-            input_service.mouse_click(data.get("button", "left"), 2)
+            await _run_input(input_service.mouse_click, data.get("button", "left"), 2)
         elif action in ("down", "button_down"):
-            input_service.mouse_down(data.get("button", "left"))
+            await _run_input(input_service.mouse_down, data.get("button", "left"))
         elif action in ("up", "button_up"):
-            input_service.mouse_up(data.get("button", "left"))
+            await _run_input(input_service.mouse_up, data.get("button", "left"))
     except Exception as e:
         log.error(f"Mouse command '{action}' failed: {e}")
 
@@ -64,22 +85,20 @@ async def handle_keyboard_command(data: Dict[str, Any], permissions: List[str]):
         action = data.get("action")
         scan_code = data.get("scan_code")
         if scan_code is not None:
-            await asyncio.to_thread(
-                input_service.raw_key, int(scan_code), action == "down"
-            )
+            await _run_input(input_service.raw_key, int(scan_code), action == "down")
             return
 
         key = data.get("key")
         modifiers = data.get("modifiers", [])
 
         if action == "down" and key:
-            await asyncio.to_thread(input_service.key_down, key, modifiers)
+            await _run_input(input_service.key_down, key, modifiers)
         elif action == "up" and key:
-            await asyncio.to_thread(input_service.key_up, key, modifiers)
+            await _run_input(input_service.key_up, key, modifiers)
         elif text := data.get("text"):
-            await asyncio.to_thread(input_service.keyboard_type, text)
+            await _run_input(input_service.keyboard_type, text)
         elif key:
-            await asyncio.to_thread(input_service.keyboard_press_key, key, modifiers)
+            await _run_input(input_service.keyboard_press_key, key, modifiers)
     except Exception as e:
         log.error(f"Keyboard command failed: {e}", exc_info=True)
 
@@ -111,8 +130,8 @@ async def mobile_websocket_endpoint(websocket: WebSocket, token: str = Query(Non
         return await websocket.close(code=1008, reason="INVALID_OR_REVOKED_TOKEN")
 
     device_id = device.device_id
-    device_manager.update_device_ip(device_id, client_host)
-    device_manager.update_device_last_seen(device_id)
+    await asyncio.to_thread(device_manager.update_device_ip, device_id, client_host)
+    await asyncio.to_thread(device_manager.update_device_last_seen, device_id)
 
     await mobile_manager.connect(websocket, device_id)
     log_telemetry_event(
@@ -198,11 +217,11 @@ async def mobile_websocket_endpoint(websocket: WebSocket, token: str = Query(Non
                     cmd_type = raw_bytes[0]
                     if cmd_type == 0x01 and len(raw_bytes) >= 5:  # MOUSE_MOVE
                         dx, dy = struct.unpack(">hh", raw_bytes[1:5])
-                        input_service.mouse_move(dx, dy)
+                        await _run_input(input_service.mouse_move, dx, dy)
                         continue
                     elif cmd_type == 0x02 and len(raw_bytes) >= 5:  # MOUSE_SCROLL
                         dx, dy = struct.unpack(">hh", raw_bytes[1:5])
-                        input_service.mouse_scroll(dx, dy)
+                        await _run_input(input_service.mouse_scroll, dx, dy)
                         continue
                     elif cmd_type == 0x03 and len(raw_bytes) >= 3:  # MOUSE_BUTTON
                         btn_code = raw_bytes[1]
@@ -211,15 +230,17 @@ async def mobile_websocket_endpoint(websocket: WebSocket, token: str = Query(Non
                             btn_code, "left"
                         )
                         if btn_action == 1:
-                            input_service.mouse_down(btn_name)
+                            await _run_input(input_service.mouse_down, btn_name)
                         elif btn_action == 0:
-                            input_service.mouse_up(btn_name)
+                            await _run_input(input_service.mouse_up, btn_name)
                         elif btn_action == 2:
-                            input_service.mouse_click(btn_name, 1)
+                            await _run_input(input_service.mouse_click, btn_name, 1)
                         continue
                     elif cmd_type == 0x04 and len(raw_bytes) >= 4:  # KEY_RAW
                         scan_code, action_val = struct.unpack(">HB", raw_bytes[1:4])
-                        input_service.raw_key(scan_code, action_val == 1)
+                        await _run_input(
+                            input_service.raw_key, scan_code, action_val == 1
+                        )
                         continue
 
             # --- JSON Text Frame Fallback ---
@@ -238,7 +259,7 @@ async def mobile_websocket_endpoint(websocket: WebSocket, token: str = Query(Non
                     if msg_type == "ping":
                         await websocket.send_json({"type": "pong"})
                     elif msg_type == "mouse_control":
-                        handle_mouse_command_fast(data, permissions)
+                        await handle_mouse_command_fast(data, permissions)
                     elif msg_type == "keyboard_control":
                         await handle_keyboard_command(data, permissions)
                     elif msg_type == "media_control" and "media" in permissions:

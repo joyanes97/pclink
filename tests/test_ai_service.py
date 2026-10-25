@@ -14,7 +14,6 @@ from fastapi import HTTPException
 
 from pclink.services.ai_service import DEFAULT_CONFIG, ai_service
 
-
 # ==========================================
 # Input validation / path safety
 # ==========================================
@@ -441,3 +440,130 @@ def test_ai_config_route_applies_and_validates(api_client):
 
         invalid = api_client.post("/ai/config", json={"port": 70000})
         assert invalid.status_code == 400
+
+
+# ==========================================
+# Client/host state synchronization
+# ==========================================
+
+
+def test_normalize_chat_model_overrides_stale_and_default_values():
+    with patch.object(
+        ai_service, "get_active_model_name", return_value="active-Q4_K_M.gguf"
+    ):
+        for requested in ("default", "pclink", "stale.gguf", None):
+            body = {"model": requested} if requested is not None else {}
+            assert ai_service.normalize_chat_model(body) == "active-Q4_K_M.gguf"
+            assert body["model"] == "active-Q4_K_M.gguf"
+
+
+def test_chat_route_normalizes_model_to_active_weight(api_client):
+    captured = {}
+
+    async def fake_sync(body):
+        captured.update(body)
+        return {"id": "chatcmpl-test", "choices": []}
+
+    with patch.object(ai_service, "ensure_running", new=AsyncMock()), patch.object(
+        ai_service, "get_active_model_name", return_value="tiny-Q4_K_M.gguf"
+    ), patch.object(ai_service, "proxy_sync_chat", new=fake_sync):
+        response = api_client.post(
+            "/ai/v1/chat/completions",
+            json={
+                "model": "default",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert captured["model"] == "tiny-Q4_K_M.gguf"
+    assert response.headers["x-pclink-model"] == "tiny-Q4_K_M.gguf"
+
+
+def test_get_status_exposes_state_revision_and_tunables():
+    cfg = dict(DEFAULT_CONFIG)
+    with patch.object(
+        ai_service, "_get_installed_models_sync", return_value=[]
+    ), patch.object(
+        ai_service, "get_engine_state", return_value="stopped"
+    ), patch.object(ai_service, "_read_config", return_value=cfg), patch.object(
+        ai_service, "get_active_engine_path", return_value=None
+    ), patch.object(
+        ai_service, "get_active_model_name", return_value=None
+    ), patch.object(ai_service, "_system_profile", return_value={}):
+        status = asyncio.run(ai_service.get_status())
+
+    assert status["state_revision"] == ai_service.get_state_revision()
+    for key in (
+        "context_size",
+        "gpu_layers",
+        "port",
+        "threads",
+        "parallel",
+        "startup_timeout_seconds",
+        "request_timeout_seconds",
+    ):
+        assert key in status["config"]
+
+
+def test_capabilities_advertise_local_ai():
+    from pclink.core.capabilities import resolve_server_capabilities
+
+    with patch("pclink.core.capabilities.config_manager") as config_mock:
+        config_mock.get.side_effect = lambda key, default=None: (
+            default if default is not None else {}
+        )
+        assert "ai_local" in resolve_server_capabilities()
+
+
+def test_start_server_returns_running_engine_for_same_model(tmp_path):
+    engine = tmp_path / "llama-server"
+    engine.write_bytes(b"")
+    model = tmp_path / "same.gguf"
+    model.write_bytes(b"")
+    process = SimpleNamespace(poll=lambda: None)
+    stop = AsyncMock()
+
+    with patch.object(
+        ai_service, "get_active_engine_path", return_value=engine
+    ), patch.object(
+        ai_service, "get_active_model_path", return_value=model
+    ), patch.object(
+        ai_service, "get_active_model_name", return_value="same.gguf"
+    ), patch.object(ai_service, "process", process), patch.object(
+        ai_service, "_loading_model", "same.gguf"
+    ), patch.object(ai_service, "_stop_server_locked", new=stop), patch.object(
+        ai_service, "get_engine_state", return_value="ready"
+    ):
+        result = asyncio.run(ai_service._start_server_locked())
+
+    assert result["state"] == "ready"
+    stop.assert_not_awaited()
+
+
+def test_start_server_restarts_when_active_model_changed(tmp_path):
+    engine = tmp_path / "llama-server"
+    engine.write_bytes(b"")
+    model = tmp_path / "new.gguf"
+    model.write_bytes(b"")
+    process = SimpleNamespace(poll=lambda: None)
+    stop = AsyncMock()
+
+    with patch.object(
+        ai_service, "get_active_engine_path", return_value=engine
+    ), patch.object(
+        ai_service, "get_active_model_path", return_value=model
+    ), patch.object(
+        ai_service, "get_active_model_name", return_value="new.gguf"
+    ), patch.object(ai_service, "process", process), patch.object(
+        ai_service, "_loading_model", "old.gguf"
+    ), patch.object(ai_service, "_stop_server_locked", new=stop), patch.object(
+        ai_service, "get_port", return_value=38191
+    ), patch.object(ai_service, "_is_port_in_use", return_value=True), patch.object(
+        ai_service, "_probe_llama_health", return_value=(False, "down")
+    ):
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(ai_service._start_server_locked())
+
+    stop.assert_awaited_once()
+    assert exc.value.status_code == 409

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025 AZHAR ZOUHIR / BYTEDz
 
+import asyncio
 import gettext
 import logging
 from typing import Optional, Union
@@ -115,9 +116,13 @@ async def get_authenticated_device(
         if request.client:
             client_ip = request.client.host
             if device.current_ip != client_ip:
-                device_mgr.update_device_ip(device.device_id, client_ip)
-            else:
-                device_mgr.update_device_last_seen(device.device_id)
+                await asyncio.to_thread(
+                    device_mgr.update_device_ip, device.device_id, client_ip
+                )
+            elif device_mgr.touch_device(device):
+                await asyncio.to_thread(
+                    device_mgr.update_device_last_seen, device.device_id
+                )
         return device
 
     raise HTTPException(status_code=403, detail="DEVICE_REVOKED")
@@ -149,9 +154,13 @@ async def verify_api_key(
             if request.client:
                 client_ip = request.client.host
                 if device.current_ip != client_ip:
-                    device_mgr.update_device_ip(device.device_id, client_ip)
-                else:
-                    device_mgr.update_device_last_seen(device.device_id)
+                    await asyncio.to_thread(
+                        device_mgr.update_device_ip, device.device_id, client_ip
+                    )
+                elif device_mgr.touch_device(device):
+                    await asyncio.to_thread(
+                        device_mgr.update_device_last_seen, device.device_id
+                    )
             return True
         raise HTTPException(status_code=403, detail="DEVICE_REVOKED")
 
