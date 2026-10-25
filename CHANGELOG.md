@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.1.0] - 2026-10-25
+
+### Added
+
+* Enhance release process and version management (d9b48c1)
+* implement chat admission control and enhance AI service error handling (b362b38)
+* add local AI engine tab panel for managing llama.cpp runtime and model weights (2ced7f5)
+
+### Other Changes
+
+* Enhance AI service and dependencies with model normalization and state management (b6a5679)
+* Refactor asset versioning in HTML templates and enhance batch action bar UI (03f9830)
+
+**Full Changelog**: https://github.com/BYTEDz/PCLink/compare/v5.0.0...v5.1.0
+
 ## [5.0.0] - 2026-10-08
 
 # PCLink v5.0.0 — Dimension

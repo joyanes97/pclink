@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 AZHAR ZOUHIR / BYTEDz
 
-__version__ = "5.0.0"
+__version__ = "5.1.0"
 __app_name__ = "PCLink"
 
 
