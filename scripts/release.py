@@ -40,30 +40,32 @@ CONVENTIONAL_COMMIT_RE = re.compile(r"^([A-Za-z]+)(?:\([^)]*\))?!?:\s*(.+)$")
 HEADING_RE = re.compile(r"^(#{1,6})(\s+.*)$")
 
 COMMIT_GROUPS = {
-    "feat": "Added",
-    "fix": "Fixed",
+    "feat": "Features",
+    "fix": "Bug Fixes",
     "perf": "Performance",
-    "refactor": "Changed",
-    "docs": "Documentation",
-    "test": "Tests",
-    "build": "Maintenance",
-    "ci": "Maintenance",
-    "chore": "Maintenance",
-    "style": "Maintenance",
-    "revert": "Reverted",
+    "security": "Security",
+    "refactor": "Refactoring",
+    "docs": "Other Changes",
+    "chore": "Other Changes",
+    "style": "Other Changes",
+    "test": "Other Changes",
+    "build": "Other Changes",
+    "ci": "Other Changes",
+    "revert": "Other Changes",
 }
 
 GROUP_ORDER = [
-    "Added",
-    "Changed",
-    "Fixed",
+    "Features",
+    "Bug Fixes",
     "Performance",
-    "Documentation",
-    "Tests",
-    "Maintenance",
-    "Reverted",
+    "Security",
+    "Refactoring",
     "Other Changes",
 ]
+
+PR_LINK_RE = re.compile(r"/pull/(\d+)")
+PR_SUFFIX_RE = re.compile(r"\s*\(#(\d+)\)\s*$")
+GENERATED_AUTHOR_RE = re.compile(r"\s+by\s+@([A-Za-z0-9_.-]+)")
 
 
 class Colors:
@@ -430,19 +432,61 @@ def generate_github_notes(repo, tag, previous_tag, head_sha):
     return body
 
 
-def git_log_notes(previous_tag):
-    """Build grouped release notes from commits when GitHub has no PR notes."""
+def split_conventional_subject(subject):
+    """Return (type, cleaned message, PR number) for a commit subject."""
+    subject = subject.strip()
+    match = CONVENTIONAL_COMMIT_RE.match(subject)
+    if match:
+        commit_type = match.group(1).lower()
+        message = match.group(2).strip()
+    else:
+        commit_type = "other"
+        message = subject
+
+    pr_number = None
+    pr_match = PR_SUFFIX_RE.search(message)
+    if pr_match:
+        pr_number = pr_match.group(1)
+        message = message[: pr_match.start()].strip()
+
+    return commit_type, re.sub(r"\s+", " ", message).strip(), pr_number
+
+
+def make_note_entry(subject, author, short_hash="", pr_number=None):
+    """Create a normalized note entry from a commit subject."""
+    commit_type, message, subject_pr = split_conventional_subject(subject)
+    if not message:
+        message = subject.strip()
+
+    return {
+        "type": commit_type,
+        "group": COMMIT_GROUPS.get(commit_type, "Other Changes"),
+        "message": message,
+        "author": author.strip(),
+        "short_hash": short_hash.strip(),
+        "pr": pr_number or subject_pr,
+    }
+
+
+def git_log_entries(previous_tag):
+    """Parse commits since the previous tag into structured note entries."""
     revision_range = f"{previous_tag}..HEAD" if previous_tag else "HEAD"
     result = run_capture(
-        ["git", "log", "--no-merges", "--format=%h%x09%s", revision_range]
+        [
+            "git",
+            "log",
+            "--no-merges",
+            "--format=%h%x09%an%x09%s",
+            revision_range,
+        ]
     )
 
-    grouped = {}
+    entries = []
     for line in result.stdout.splitlines():
-        if "\t" not in line:
+        parts = line.split("\t", 2)
+        if len(parts) != 3:
             continue
-        short_sha, subject = line.split("\t", 1)
-        subject = subject.strip()
+        short_sha, author, subject = (part.strip() for part in parts)
         if not subject:
             continue
         if subject.startswith("Bump version to "):
@@ -450,16 +494,104 @@ def git_log_notes(previous_tag):
         if subject.lower().startswith("chore: reset release_notes"):
             continue
 
-        match = CONVENTIONAL_COMMIT_RE.match(subject)
-        if match:
-            commit_type = match.group(1).lower()
-            description = match.group(2).strip()
-            group = COMMIT_GROUPS.get(commit_type, "Other Changes")
-        else:
-            description = subject
-            group = "Other Changes"
+        entries.append(make_note_entry(subject, author, short_hash=short_sha))
 
-        grouped.setdefault(group, []).append(f"* {description} ({short_sha})")
+    return entries
+
+
+def format_author(author):
+    """Format a Git author name as a GitHub-style mention."""
+    value = author.strip()
+    if value.startswith("@"):
+        value = value[1:]
+    value = re.sub(r"\s+", "_", value)
+    value = re.sub(r"[^\w.@-]", "", value)
+    return f"@{value}" if value else "@unknown"
+
+
+def format_note_entry(entry):
+    """Render one bullet in the style: message by @author in reference."""
+    author = format_author(entry.get("author", ""))
+    if entry.get("pr"):
+        reference = f"#{entry['pr']}"
+    else:
+        reference = entry.get("short_hash", "")
+
+    if reference:
+        return f"* {entry['message']} by {author} in {reference}"
+    return f"* {entry['message']} by {author}"
+
+
+def note_entry_key(entry):
+    """Return a stable key used to deduplicate git and GitHub entries."""
+    if entry.get("pr"):
+        return f"pr:{entry['pr']}"
+    message = re.sub(r"\W+", " ", entry.get("message", "").lower()).strip()
+    return f"message:{message}"
+
+
+def note_message_key(entry):
+    return re.sub(r"\W+", " ", entry.get("message", "").lower()).strip()
+
+
+def merge_note_entries(git_entries, generated_entries):
+    """Merge GitHub PR entries into git entries, preferring GitHub usernames."""
+    generated_by_pr = {
+        entry["pr"]: entry for entry in generated_entries if entry.get("pr")
+    }
+    generated_by_message = {
+        note_message_key(entry): entry
+        for entry in generated_entries
+        if note_message_key(entry)
+    }
+
+    used_generated = set()
+    merged = []
+    for git_entry in git_entries:
+        match = None
+        if git_entry.get("pr"):
+            match = generated_by_pr.get(git_entry["pr"])
+        if match is None:
+            match = generated_by_message.get(note_message_key(git_entry))
+
+        if match is not None:
+            used_generated.add(id(match))
+            git_entry = dict(git_entry)
+            git_entry["pr"] = git_entry.get("pr") or match.get("pr")
+            if match.get("author"):
+                git_entry["author"] = match["author"]
+            if git_entry.get("type") == "other" and match.get("type") != "other":
+                git_entry["type"] = match["type"]
+                git_entry["group"] = match["group"]
+
+        merged.append(git_entry)
+
+    for generated_entry in generated_entries:
+        if id(generated_entry) in used_generated:
+            continue
+        merged.append(generated_entry)
+
+    unique = []
+    seen = set()
+    for entry in merged:
+        key = note_entry_key(entry)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(entry)
+
+    return unique
+
+
+def format_release_note_entries(entries):
+    """Format structured entries into KDE-style categorized markdown."""
+    grouped = {}
+    for entry in entries:
+        group = entry.get("group") or "Other Changes"
+        bullet = format_note_entry(entry)
+        grouped.setdefault(group, [])
+        if bullet not in grouped[group]:
+            grouped[group].append(bullet)
 
     sections = []
     for group in GROUP_ORDER:
@@ -530,21 +662,61 @@ def extract_generated_sections(body):
     return "\n".join(core_lines).strip(), compare_line
 
 
-def compose_release_notes(curated, github_body, git_notes, repo, previous_tag, tag):
-    """Combine curated notes, generated PR notes, and the git-log fallback."""
-    generated_core, compare_line = extract_generated_sections(github_body)
+def parse_github_notes(body):
+    """Parse GitHub's generated notes into PR-aware structured entries."""
+    if not body:
+        return [], None
+
+    core, compare_line = extract_generated_sections(body)
+    entries = []
+    for line in core.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("## new contributors"):
+            break
+        if not stripped.startswith("* "):
+            continue
+
+        content = stripped[2:].strip()
+        if not content or "made their first contribution" in content.lower():
+            continue
+
+        pr_match = PR_LINK_RE.search(content)
+        pr_number = pr_match.group(1) if pr_match else None
+        if pr_number is None:
+            hash_match = re.search(r"(?:^|\s)#(\d+)\b", content)
+            if hash_match:
+                pr_number = hash_match.group(1)
+
+        author_match = GENERATED_AUTHOR_RE.search(content)
+        author = author_match.group(1) if author_match else ""
+
+        message = re.split(r"\s+by\s+@[A-Za-z0-9_.-]+", content, maxsplit=1)[0]
+        message = re.sub(r"\s+in\s+https?://\S+", "", message).strip()
+        if not message:
+            continue
+
+        entries.append(make_note_entry(message, author, pr_number=pr_number))
+
+    return entries, compare_line
+
+
+def compose_release_notes(curated, github_body, git_entries, repo, previous_tag, tag):
+    """Combine curated notes, GitHub PR entries, and the git-log fallback."""
+    generated_entries, compare_line = parse_github_notes(github_body)
+    entries = merge_note_entries(git_entries, generated_entries)
     sections = []
-    used_git_fallback = False
+    used_git_fallback = not generated_entries and bool(git_entries)
 
     if curated.strip():
         sections.append(normalize_heading_levels(curated))
 
-    if generated_core:
-        sections.append(normalize_heading_levels(generated_core))
-
-    if not generated_core and git_notes.strip():
-        sections.append(git_notes.strip())
-        used_git_fallback = True
+    formatted_entries = format_release_note_entries(entries)
+    if formatted_entries:
+        sections.append(formatted_entries)
+    elif github_body:
+        generated_core, _ = extract_generated_sections(github_body)
+        if generated_core:
+            sections.append(normalize_heading_levels(generated_core))
 
     if not sections:
         sections.append("- No changes documented")
@@ -829,9 +1001,9 @@ def run_release(args):
             )
 
     github_notes = generate_github_notes(repo, tag, previous_tag, context["head"])
-    git_notes = git_log_notes(previous_tag)
+    git_entries = git_log_entries(previous_tag)
     notes, used_git_fallback = compose_release_notes(
-        curated, github_notes, git_notes, repo, previous_tag, tag
+        curated, github_notes, git_entries, repo, previous_tag, tag
     )
 
     if used_git_fallback:
